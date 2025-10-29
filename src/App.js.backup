@@ -1,0 +1,3792 @@
+import React, { useState, useCallback, useRef, useEffect } from 'react';
+import './App.css';
+import { electronAPI, isElectron } from './utils/electronAPI';
+import VideoPreview from './components/VideoPreview';
+
+// Simple Video Preview Panel Wrapper
+const VideoPreviewPanel = ({ videoFile, timelineClips, currentTimelineTime, onTimeChange, onVideoStateChange }) => {
+  const [videoUrl, setVideoUrl] = useState(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isSeeking, setIsSeeking] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [volume, setVolume] = useState(1);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const [showFrameAtPlayhead, setShowFrameAtPlayhead] = useState(false);
+  const [currentFrame, setCurrentFrame] = useState(null);
+
+  const videoRef = useRef(null);
+  const lastUpdateTimeRef = useRef(0);
+  const frameCanvasRef = useRef(null);
+  const animationRef = useRef(null);
+  const lastTimeRef = useRef(Date.now());
+
+  // Find active clip at current time
+  const getActiveClip = useCallback((time) => {
+    return timelineClips.find(clip => 
+      time >= clip.startTime && 
+      time < (clip.startTime + (clip.duration || clip.endTime - clip.startTime))
+    );
+  }, [timelineClips]);
+
+  // Enhanced video file handling with debugging
+  useEffect(() => {
+    if (videoFile) {
+      console.log('VideoPreviewPanel: Processing videoFile:', videoFile);
+      
+      let url = null;
+      
+      if (videoFile.isElectronFile) {
+        url = `file://${videoFile.path}`;
+        console.log('VideoPreviewPanel: Using Electron file URL:', url);
+      } else if (videoFile.url && videoFile.url.startsWith('blob:')) {
+        // For recordings with blob URL, use it directly
+        console.log('VideoPreviewPanel: Using recording blob URL:', videoFile.url);
+        url = videoFile.url;
+      } else if (videoFile.blob && (videoFile.blob instanceof File || videoFile.blob instanceof Blob)) {
+        // For recordings with blob, create object URL from blob
+        console.log('VideoPreviewPanel: Creating URL from blob');
+        try {
+          url = URL.createObjectURL(videoFile.blob);
+          console.log('VideoPreviewPanel: Created blob URL:', url);
+        } catch (error) {
+          console.error('VideoPreviewPanel: Failed to create object URL from blob:', error);
+        }
+      } else if (videoFile.file && (videoFile.file instanceof File || videoFile.file instanceof Blob)) {
+        // For imported files with file property (most common case)
+        console.log('VideoPreviewPanel: Creating URL from file property');
+        try {
+          url = URL.createObjectURL(videoFile.file);
+          console.log('VideoPreviewPanel: Created file URL:', url);
+        } catch (error) {
+          console.error('VideoPreviewPanel: Failed to create object URL from file:', error);
+        }
+      } else if (videoFile instanceof File || videoFile instanceof Blob) {
+        // For regular files/blobs
+        console.log('VideoPreviewPanel: Creating URL from File/Blob');
+        try {
+          url = URL.createObjectURL(videoFile);
+          console.log('VideoPreviewPanel: Created file URL:', url);
+        } catch (error) {
+          console.error('VideoPreviewPanel: Failed to create object URL from File/Blob:', error);
+        }
+      } else if (videoFile.path) {
+        // For Electron files with path
+        url = `file://${videoFile.path}`;
+        console.log('VideoPreviewPanel: Using file path URL:', url);
+      }
+      
+      // Only set videoUrl if we have a valid URL
+      if (url && url !== 'http://localhost:3000/' && url !== 'http://localhost:3000') {
+      console.log('VideoPreviewPanel: Setting video URL:', url);
+      setVideoUrl(url);
+      } else {
+        console.log('VideoPreviewPanel: Invalid or empty URL, not setting videoUrl. URL was:', url);
+        setVideoUrl(null);
+      }
+      
+      // Set duration from video file metadata if available
+      if (videoFile.duration) {
+        setDuration(videoFile.duration);
+        if (onVideoStateChange) {
+          onVideoStateChange({ duration: videoFile.duration, isPlaying: false });
+        }
+      }
+    } else {
+      console.log('VideoPreviewPanel: No video file provided, clearing videoUrl');
+      setVideoUrl(null);
+    }
+  }, [videoFile, onVideoStateChange]);
+
+  // Enhanced video element configuration
+  useEffect(() => {
+    const videoElement = videoRef.current;
+    if (!videoElement || !videoUrl) return;
+
+    // Configure video element
+    videoElement.preload = 'metadata';
+    videoElement.crossOrigin = 'anonymous';
+    videoElement.muted = isMuted;
+    videoElement.volume = volume;
+
+    // Add event listeners for debugging
+    const handleLoadStart = () => console.log('Video load started');
+    const handleCanPlay = () => console.log('Video can play');
+    const handleCanPlayThrough = () => console.log('Video can play through');
+    const handleLoadedData = () => console.log('Video data loaded');
+
+    videoElement.addEventListener('loadstart', handleLoadStart);
+    videoElement.addEventListener('canplay', handleCanPlay);
+    videoElement.addEventListener('canplaythrough', handleCanPlayThrough);
+    videoElement.addEventListener('loadeddata', handleLoadedData);
+
+    return () => {
+      videoElement.removeEventListener('loadstart', handleLoadStart);
+      videoElement.removeEventListener('canplay', handleCanPlay);
+      videoElement.removeEventListener('canplaythrough', handleCanPlayThrough);
+      videoElement.removeEventListener('loadeddata', handleLoadedData);
+    };
+  }, [videoUrl, isMuted, volume]);
+
+  // Core video synchronization - Update video when timeline time changes
+  useEffect(() => {
+    console.log('VideoPreviewPanel: Core sync effect triggered');
+    console.log('VideoPreviewPanel: currentTimelineTime:', currentTimelineTime);
+    console.log('VideoPreviewPanel: timelineClips:', timelineClips);
+    
+    const activeClip = getActiveClip(currentTimelineTime);
+    
+    if (activeClip && videoRef.current) {
+      console.log('VideoPreviewPanel: Active clip found:', activeClip);
+      console.log('VideoPreviewPanel: Active clip media:', activeClip.media);
+      
+      // Switch video source if needed
+      let videoPath = null;
+      
+      // Try different media sources in order of priority
+      if (activeClip.media?.url) {
+        videoPath = activeClip.media.url;
+        console.log('VideoPreviewPanel: Using media.url:', videoPath);
+      } else if (activeClip.media?.file && (activeClip.media.file instanceof File || activeClip.media.file instanceof Blob)) {
+        try {
+          videoPath = URL.createObjectURL(activeClip.media.file);
+          console.log('VideoPreviewPanel: Created URL from media.file:', videoPath);
+        } catch (error) {
+          console.error('VideoPreviewPanel: Failed to create URL from media.file:', error);
+        }
+      } else if (activeClip.media?.blob && (activeClip.media.blob instanceof File || activeClip.media.blob instanceof Blob)) {
+        try {
+          videoPath = URL.createObjectURL(activeClip.media.blob);
+          console.log('VideoPreviewPanel: Created URL from media.blob:', videoPath);
+        } catch (error) {
+          console.error('VideoPreviewPanel: Failed to create URL from media.blob:', error);
+        }
+      } else if (activeClip.media?.path) {
+        videoPath = `file://${activeClip.media.path}`;
+        console.log('VideoPreviewPanel: Using media.path:', videoPath);
+      } else if (activeClip.path) {
+        videoPath = `file://${activeClip.path}`;
+        console.log('VideoPreviewPanel: Using clip.path:', videoPath);
+      }
+      
+      console.log('VideoPreviewPanel: Final video path:', videoPath);
+      
+      if (videoPath && videoRef.current.src !== videoPath) {
+        console.log('VideoPreviewPanel: Switching video source to:', videoPath);
+        videoRef.current.src = videoPath;
+        setVideoUrl(videoPath); // Update state to match
+        
+        // Wait for video to load before seeking
+        const handleLoadedData = () => {
+          console.log('VideoPreviewPanel: Video loaded, seeking to position');
+          const clipLocalTime = currentTimelineTime - activeClip.startTime + (activeClip.trimStart || 0);
+          videoRef.current.currentTime = clipLocalTime;
+          videoRef.current.removeEventListener('loadeddata', handleLoadedData);
+        };
+        
+        videoRef.current.addEventListener('loadeddata', handleLoadedData);
+      } else if (videoPath) {
+        // Video source is already correct, just seek
+        const clipLocalTime = currentTimelineTime - activeClip.startTime + (activeClip.trimStart || 0);
+        console.log('VideoPreviewPanel: Seeking to clip local time:', clipLocalTime);
+        
+        if (Math.abs(videoRef.current.currentTime - clipLocalTime) > 0.1) {
+          videoRef.current.currentTime = clipLocalTime;
+        }
+      }
+      
+        setCurrentTime(currentTimelineTime);
+    } else {
+      console.log('VideoPreviewPanel: No active clip at time:', currentTimelineTime);
+      console.log('VideoPreviewPanel: Available clips:', timelineClips.map(c => ({ 
+        id: c.id, 
+        startTime: c.startTime, 
+        duration: c.duration,
+        hasMedia: !!c.media 
+      })));
+      
+      // No active clip, pause video
+      if (videoRef.current && !videoRef.current.paused) {
+        videoRef.current.pause();
+      }
+    }
+  }, [currentTimelineTime, timelineClips, getActiveClip]);
+
+  // Initialize video source from timeline clips if no videoFile is provided
+  useEffect(() => {
+    if (!videoFile && timelineClips.length > 0 && !videoUrl) {
+      console.log('VideoPreviewPanel: Initializing video from timeline clips');
+      const firstClip = timelineClips[0];
+      if (firstClip && firstClip.media) {
+        let videoPath = null;
+        
+        // Try different media sources in order of priority
+        if (firstClip.media?.url) {
+          videoPath = firstClip.media.url;
+        } else if (firstClip.media?.file && (firstClip.media.file instanceof File || firstClip.media.file instanceof Blob)) {
+          videoPath = URL.createObjectURL(firstClip.media.file);
+        } else if (firstClip.media?.blob && (firstClip.media.blob instanceof File || firstClip.media.blob instanceof Blob)) {
+          videoPath = URL.createObjectURL(firstClip.media.blob);
+        } else if (firstClip.media?.path) {
+          videoPath = `file://${firstClip.media.path}`;
+        }
+        
+        if (videoPath) {
+          console.log('VideoPreviewPanel: Setting initial video source:', videoPath);
+          setVideoUrl(videoPath);
+        }
+      }
+    }
+  }, [videoFile, timelineClips, videoUrl]);
+
+  // Capture frame at specific time
+  const captureFrameAtTime = useCallback((time) => {
+    if (!videoRef.current || !frameCanvasRef.current) return;
+    
+    const canvas = frameCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+    
+    // Set canvas size to match video
+    canvas.width = videoRef.current.videoWidth || 320;
+    canvas.height = videoRef.current.videoHeight || 240;
+    
+    // Draw current frame
+    ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+    
+    // Convert to data URL for display
+    const frameDataUrl = canvas.toDataURL('image/jpeg', 0.8);
+    setCurrentFrame(frameDataUrl);
+  }, []);
+
+  // Enhanced time update handler with better synchronization
+  const handleTimeUpdate = () => {
+    if (videoRef.current && !isSeeking) {
+      const newTime = videoRef.current.currentTime;
+      setCurrentTime(newTime);
+      
+      // Update timeline every full second for proper 1-second increments
+      if (onTimeChange) {
+        const currentSecond = Math.floor(newTime);
+        const lastSecond = Math.floor(lastUpdateTimeRef.current);
+        
+        if (currentSecond !== lastSecond) {
+          lastUpdateTimeRef.current = newTime;
+          onTimeChange(newTime);
+          
+          // Capture frame at timeline position
+          if (showFrameAtPlayhead) {
+            captureFrameAtTime(newTime);
+          }
+        }
+      }
+    }
+  };
+
+  const handleLoadedMetadata = () => {
+    if (videoRef.current) {
+      const videoDuration = videoRef.current.duration;
+      setDuration(videoDuration);
+      if (onVideoStateChange) {
+        onVideoStateChange({ duration: videoDuration, isPlaying: isPlaying });
+      }
+    }
+  };
+
+  const handlePlayPause = async () => {
+    if (isPlaying) {
+      pause();
+      } else {
+      play();
+    }
+  };
+
+  const play = useCallback(() => {
+    console.log('VideoPreviewPanel: Starting playback');
+    setIsPlaying(true);
+    lastTimeRef.current = Date.now();
+    
+    const animate = () => {
+      const now = Date.now();
+      const delta = (now - lastTimeRef.current) / 1000;
+      lastTimeRef.current = now;
+      
+      setCurrentTime(prev => {
+        const newTime = prev + delta;
+        // Notify parent of time change
+        if (onTimeChange) {
+          onTimeChange(newTime);
+        }
+        return newTime;
+      });
+      
+      // Play video element
+      if (videoRef.current && videoRef.current.paused) {
+        videoRef.current.play().catch(err => {
+          console.error('VideoPreviewPanel: Play error:', err);
+        });
+      }
+      
+      if (isPlaying) {
+        animationRef.current = requestAnimationFrame(animate);
+      }
+    };
+    
+    animationRef.current = requestAnimationFrame(animate);
+  }, [isPlaying, onTimeChange]);
+
+  const pause = useCallback(() => {
+    console.log('VideoPreviewPanel: Pausing playback');
+    setIsPlaying(false);
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.pause();
+    }
+  }, []);
+
+  const handleSeekStart = () => {
+    setIsSeeking(true);
+  };
+
+  const handleSeekEnd = () => {
+    setIsSeeking(false);
+  };
+
+  const handleError = (e) => {
+    console.error('VideoPreviewPanel: Video error:', e);
+    console.error('VideoPreviewPanel: Video error details:', {
+      error: e.target.error,
+      networkState: e.target.networkState,
+      readyState: e.target.readyState,
+      src: e.target.src,
+      currentSrc: e.target.currentSrc
+    });
+    
+    // Additional debugging with format-specific error messages
+    if (e.target.error) {
+      console.error('VideoPreviewPanel: Error code:', e.target.error.code);
+      console.error('VideoPreviewPanel: Error message:', e.target.error.message);
+      
+      // Provide specific error messages for different issues
+      switch (e.target.error.code) {
+        case 1: // MEDIA_ERR_ABORTED
+          console.warn('VideoPreviewPanel: Video loading was aborted');
+          break;
+        case 2: // MEDIA_ERR_NETWORK
+          console.error('VideoPreviewPanel: Network error while loading video');
+          break;
+        case 3: // MEDIA_ERR_DECODE
+          console.error('VideoPreviewPanel: Video decoding error - format may not be supported');
+          // Check if this is a MOV file for more specific error messaging
+          const isMovFile = e.target.src && (e.target.src.includes('.mov') || e.target.src.includes('quicktime'));
+          if (isMovFile) {
+            console.error('VideoPreviewPanel: MOV file detected - ensure codec is supported (H.264 recommended)');
+          }
+          break;
+        case 4: // MEDIA_ERR_SRC_NOT_SUPPORTED
+          console.error('VideoPreviewPanel: Video format not supported - try MP4, MOV, or WebM files');
+          // Check if this is a MOV file for more specific error messaging
+          const isMovFileUnsupported = e.target.src && (e.target.src.includes('.mov') || e.target.src.includes('quicktime'));
+          if (isMovFileUnsupported) {
+            console.error('VideoPreviewPanel: MOV file not supported - try converting to MP4 with H.264 codec');
+          }
+          break;
+        default:
+          console.error('VideoPreviewPanel: Unknown video error');
+      }
+    }
+  };
+
+  const handlePlaybackSpeedChange = (speed) => {
+    setPlaybackSpeed(speed);
+    if (videoRef.current) {
+      videoRef.current.playbackRate = speed;
+    }
+  };
+
+  const handleFrameStep = (direction) => {
+    if (videoRef.current) {
+      const frameTime = 1 / 30; // Assuming 30fps
+      const newTime = videoRef.current.currentTime + (direction === 'forward' ? frameTime : -frameTime);
+      videoRef.current.currentTime = Math.max(0, Math.min(newTime, duration));
+    }
+  };
+
+  const formatTime = (time) => {
+    const minutes = Math.floor(time / 60);
+    const seconds = Math.floor(time % 60);
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+  };
+
+  return (
+    <div className="video-preview-panel">
+      <div className="preview-container">
+        {videoUrl ? (
+        <video
+          ref={videoRef}
+          className="preview-video"
+          src={videoUrl}
+          onTimeUpdate={handleTimeUpdate}
+          onSeeking={handleSeekStart}
+          onSeeked={handleSeekEnd}
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+          controls={false}
+          preload="metadata"
+          crossOrigin="anonymous"
+            muted={false}
+            playsInline={true}
+            webkit-playsinline="true"
+            // Additional attributes for better MOV/QuickTime compatibility
+            x5-playsinline="true"
+            x5-video-player-type="h5"
+            x5-video-player-fullscreen="true"
+          style={{
+            width: '100%',
+            height: '100%',
+            objectFit: 'contain',
+            backgroundColor: '#000'
+          }}
+            onLoadStart={() => console.log('VideoPreviewPanel: Video load started, src:', videoUrl)}
+            onCanPlay={() => console.log('VideoPreviewPanel: Video can play, src:', videoUrl)}
+            onLoadedMetadata={(e) => {
+              console.log('VideoPreviewPanel: Video loaded metadata. src:', e.target.src, 'currentSrc:', e.target.currentSrc);
+              // Check if this is a MOV file
+              const isMovFile = e.target.src && (e.target.src.includes('.mov') || e.target.src.includes('quicktime'));
+              if (isMovFile) {
+                console.log('VideoPreviewPanel: MOV file successfully loaded metadata');
+              }
+              handleLoadedMetadata(e);
+            }}
+            onError={(e) => {
+              console.log('VideoPreviewPanel: Video error event. src:', e.target.src, 'currentSrc:', e.target.currentSrc);
+              // Check if this is a MOV file
+              const isMovFile = e.target.src && (e.target.src.includes('.mov') || e.target.src.includes('quicktime'));
+              if (isMovFile) {
+                console.log('VideoPreviewPanel: MOV file error detected');
+              }
+              handleError(e);
+            }}
+          />
+        ) : (
+          <div className="no-video">
+            <div className="no-video-icon">🎬</div>
+            <h2>No Video Loaded</h2>
+            <p>Import a video file or add clips to the timeline to see the preview</p>
+              </div>
+            )}
+      </div>
+      
+      {/* Hidden canvas for frame capture */}
+      <canvas 
+        ref={frameCanvasRef}
+        style={{ display: 'none' }}
+      />
+    </div>
+  );
+};
+
+// Recording Manager Component
+const RecordingManager = ({ onRecordingComplete }) => {
+  const [showDropdown, setShowDropdown] = useState(false);
+  const [recordingType, setRecordingType] = useState(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const [countdown, setCountdown] = useState(0);
+  const [showCountdown, setShowCountdown] = useState(false);
+  const [showStatusBar, setShowStatusBar] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [screenSources, setScreenSources] = useState([]);
+  const [selectedSource, setSelectedSource] = useState(null);
+  const [audioEnabled, setAudioEnabled] = useState(true);
+  const [showLivePreview, setShowLivePreview] = useState(false);
+  const [showTabSelector, setShowTabSelector] = useState(false);
+  
+  const mediaRecorderRef = useRef(null);
+  const streamRef = useRef(null);
+  const chunksRef = useRef([]);
+  const timerRef = useRef(null);
+  const countdownRef = useRef(null);
+  const livePreviewRef = useRef(null);
+  const recordingStartTimeRef = useRef(null);
+
+  // Recording types
+  const recordingTypes = [
+    {
+      id: 'screen',
+      name: 'Record entire screen',
+      icon: (
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <rect x="2" y="3" width="16" height="12" rx="2"/>
+          <path d="M6 1h8M8 1v2M12 1v2"/>
+        </svg>
+      ),
+      description: 'Capture your entire screen'
+    },
+    {
+      id: 'screen-mic',
+      name: 'Record screen + microphone',
+      icon: (
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <rect x="2" y="3" width="16" height="12" rx="2"/>
+          <path d="M6 1h8M8 1v2M12 1v2"/>
+          <circle cx="10" cy="16" r="2"/>
+          <path d="M8 18h4"/>
+        </svg>
+      ),
+      description: 'Capture screen with microphone audio'
+    },
+    {
+      id: 'window',
+      name: 'Record tab',
+      icon: (
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <rect x="2" y="4" width="16" height="10" rx="1"/>
+          <path d="M2 4h16M6 2h8M6 2v2M14 2v2"/>
+        </svg>
+      ),
+      description: 'Capture a specific window or tab'
+    },
+    {
+      id: 'webcam',
+      name: 'Record with webcam',
+      icon: (
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <circle cx="10" cy="8" r="3"/>
+          <path d="M7 14h6M10 12v2"/>
+        </svg>
+      ),
+      description: 'Record using your webcam'
+    },
+    {
+      id: 'audio',
+      name: 'Record audio',
+      icon: (
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5">
+          <path d="M10 1v6M6 7h8M10 7v6M6 13h8"/>
+          <path d="M3 9h14M3 11h14"/>
+        </svg>
+      ),
+      description: 'Record audio only'
+    }
+  ];
+
+  // Load screen sources
+  const loadScreenSources = useCallback(async () => {
+    console.log('Checking Electron environment...');
+    console.log('isElectron():', isElectron());
+    console.log('window.electronAPI:', !!window.electronAPI);
+    
+    if (isElectron()) {
+      try {
+        console.log('Attempting to load screen sources...');
+        const sources = await electronAPI.getScreenSources();
+        console.log('Screen sources loaded successfully:', sources);
+        setScreenSources(sources);
+        
+        if (sources.length === 0) {
+          console.warn('No screen sources found. This might be due to missing permissions.');
+          console.log('Please check System Preferences > Security & Privacy > Screen Recording');
+        }
+      } catch (error) {
+        console.error('Failed to load screen sources:', error);
+        console.log('This usually means screen recording permissions are not granted.');
+      }
+    } else {
+      console.log('Running in browser mode - screen sources not needed for getDisplayMedia');
+    }
+  }, []);
+
+  useEffect(() => {
+    loadScreenSources();
+  }, [loadScreenSources]);
+
+  // Format time helper
+  const formatTime = (seconds) => {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // Start countdown
+  const startCountdown = useCallback((type, source) => {
+    console.log('Starting countdown with type:', type, 'and source:', source);
+    setShowCountdown(true);
+    setCountdown(3);
+    
+    countdownRef.current = setInterval(() => {
+      setCountdown(prev => {
+        if (prev <= 1) {
+          clearInterval(countdownRef.current);
+          setShowCountdown(false);
+          startActualRecording(type, source);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }, [audioEnabled, onRecordingComplete]);
+
+  // Simple screen recording function (video only)
+  const startScreenRecording = async (source) => {
+    if (!source) {
+      throw new Error('No screen source selected');
+    }
+    
+    // Screen capture without audio (audio is not supported for desktop capture)
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: false, // Remove audio from screen capture
+      video: {
+        mandatory: {
+          chromeMediaSource: 'desktop',
+          chromeMediaSourceId: source.id
+        }
+      }
+    });
+    
+    return stream;
+  };
+
+  // Webcam recording function
+  const startWebcamRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { 
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 }
+        },
+        audio: audioEnabled
+      });
+      
+      console.log('Webcam stream created successfully');
+      console.log('Video tracks:', stream.getVideoTracks().map(t => ({ 
+        kind: t.kind, 
+        label: t.label, 
+        enabled: t.enabled,
+        readyState: t.readyState 
+      })));
+      
+      return stream;
+    } catch (error) {
+      console.error('Failed to access webcam:', error);
+      throw new Error('Failed to access webcam: ' + error.message);
+    }
+  };
+
+  // Screen recording with microphone function
+  const startScreenWithMicRecording = async (source) => {
+    if (!source) {
+      throw new Error('No screen source selected');
+    }
+    
+    try {
+      // Get screen video stream (no audio)
+      const screenStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          mandatory: {
+            chromeMediaSource: 'desktop',
+            chromeMediaSourceId: source.id
+          }
+        }
+      });
+
+      // Get microphone audio stream
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false
+      });
+
+      // Combine video from screen and audio from microphone
+      const combinedStream = new MediaStream([
+        ...screenStream.getVideoTracks(),
+        ...micStream.getAudioTracks()
+      ]);
+
+      return combinedStream;
+    } catch (error) {
+      console.error('Failed to combine screen and microphone streams:', error);
+      throw new Error('Failed to start screen + microphone recording: ' + error.message);
+    }
+  };
+
+  // Audio only recording function
+  const startAudioRecording = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: true,
+      video: false
+    });
+    
+    return stream;
+  };
+
+  // Universal recording function
+  const startRecording = useCallback(async (stream) => {
+    chunksRef.current = [];
+    
+    // Show controller window
+    if (isElectron() && window.electronAPI) {
+      try {
+        await window.electronAPI.showController();
+      } catch (error) {
+        console.error('Failed to show controller window:', error);
+      }
+    }
+    
+    // Show live preview for webcam recordings
+    if (recordingType === 'webcam' && livePreviewRef.current) {
+      livePreviewRef.current.srcObject = stream;
+      livePreviewRef.current.play();
+      setShowLivePreview(true);
+    }
+    
+    // Create MediaRecorder with appropriate mime type - prioritize vp8 for better compatibility
+    let mimeType = 'video/webm';
+    if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
+      mimeType = 'video/webm;codecs=vp8';
+    } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+      mimeType = 'video/webm;codecs=vp9';
+    } else if (MediaRecorder.isTypeSupported('video/mp4')) {
+      mimeType = 'video/mp4';
+    }
+
+    console.log('Using MIME type:', mimeType);
+
+    try {
+      mediaRecorderRef.current = new MediaRecorder(stream, {
+        mimeType: mimeType,
+        videoBitsPerSecond: 2500000
+      });
+      console.log('MediaRecorder created successfully');
+    } catch (error) {
+      console.error('Failed to create MediaRecorder:', error);
+      // Fallback to basic MediaRecorder without specific options
+      mediaRecorderRef.current = new MediaRecorder(stream);
+      console.log('Using fallback MediaRecorder');
+    }
+
+    // Handle data available
+    mediaRecorderRef.current.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        chunksRef.current.push(event.data);
+      }
+    };
+
+    // Handle recording stop with timeout protection
+    mediaRecorderRef.current.onstop = () => {
+      console.log('MediaRecorder onstop event fired');
+      
+      try {
+        const blob = new Blob(chunksRef.current, { type: mimeType });
+        
+        // Validate blob has data
+        if (blob.size === 0) {
+          console.error('Recording failed: Empty blob created');
+          return;
+        }
+        
+        console.log('Recording blob created successfully:', {
+          size: blob.size,
+          type: blob.type,
+          chunks: chunksRef.current.length
+        });
+        
+        const url = URL.createObjectURL(blob);
+        
+        const recordingTypeName = recordingTypes.find(t => t.id === recordingType)?.name || 'Recording';
+        const timestamp = new Date().toLocaleString().replace(/[:.]/g, '-');
+        
+        const recordingFile = {
+          name: `${recordingTypeName} ${timestamp}`,
+          size: blob.size,
+          type: mimeType,
+          url: url,
+          blob: blob,
+          isRecording: true,
+          duration: recordingTime,
+          thumbnail: null,
+          path: null,
+          lastModified: new Date().toISOString(),
+          extension: mimeType.includes('webm') ? '.webm' : mimeType.includes('mp4') ? '.mp4' : '.webm'
+        };
+
+        console.log('Recording completed:', recordingFile);
+        
+        // Use setTimeout to prevent blocking the UI
+        setTimeout(() => {
+          try {
+            onRecordingComplete(recordingFile);
+          } catch (error) {
+            console.error('Error in onRecordingComplete callback:', error);
+          }
+        }, 0);
+        
+        // Clean up URL after a longer delay to allow the recording to be processed and played
+        setTimeout(() => {
+          URL.revokeObjectURL(url);
+        }, 30000); // 30 seconds should be enough for playback
+        
+      } catch (error) {
+        console.error('Error processing recording completion:', error);
+      }
+    };
+
+    // Start recording
+    mediaRecorderRef.current.start(1000);
+    setIsRecording(true);
+    setShowStatusBar(true);
+    setRecordingTime(0);
+    recordingStartTimeRef.current = Date.now();
+
+    // Start timer using Date.now() calculation for accurate timing
+    timerRef.current = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - recordingStartTimeRef.current) / 1000);
+      setRecordingTime(elapsed);
+    }, 100); // Update every 100ms for smooth display, but calculate from start time
+  }, [recordingType, recordingTime, onRecordingComplete]);
+
+  // Start actual recording based on type
+  const startActualRecording = useCallback(async (type, source) => {
+    try {
+      console.log('Starting recording with type:', type);
+      console.log('Selected source:', source);
+      
+      // Validation check
+      if (!type) {
+        throw new Error(`Invalid recording type: ${type}. Expected: 'screen', 'webcam', or 'audio'`);
+      }
+      
+      let stream;
+
+      switch (type) {
+        case 'screen':
+          if (!source) {
+            throw new Error('No screen source selected');
+          }
+          stream = await startScreenRecording(source);
+          break;
+        case 'screen-mic':
+          if (!source) {
+            throw new Error('No screen source selected');
+          }
+          stream = await startScreenWithMicRecording(source);
+          break;
+        case 'window':
+          if (!source) {
+            throw new Error('No screen source selected');
+          }
+          stream = await startScreenRecording(source); // Same as screen for now
+          break;
+        case 'webcam':
+          stream = await startWebcamRecording();
+          break;
+        case 'audio':
+          stream = await startAudioRecording();
+          break;
+        default:
+          throw new Error(`Invalid recording type: ${type}. Expected: 'screen', 'screen-mic', 'webcam', or 'audio'`);
+      }
+
+      streamRef.current = stream;
+      startRecording(stream);
+
+    } catch (error) {
+      console.error('Failed to start recording:', error);
+      alert('Failed to start recording: ' + error.message);
+      
+      // Reset all states on error
+      setIsRecording(false);
+      setShowStatusBar(false);
+      setRecordingTime(0);
+      setRecordingType(null);
+      setSelectedSource(null);
+      setIsPaused(false);
+      
+      // Clean up any partial streams
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }
+    }
+  }, [audioEnabled, startRecording]);
+
+  // Pause/Resume recording
+  const pauseRecording = useCallback(() => {
+    if (mediaRecorderRef.current) {
+      if (mediaRecorderRef.current.state === 'recording') {
+        mediaRecorderRef.current.pause();
+        setIsPaused(true);
+        if (timerRef.current) {
+          clearInterval(timerRef.current);
+        }
+      } else if (mediaRecorderRef.current.state === 'paused') {
+        mediaRecorderRef.current.resume();
+        setIsPaused(false);
+        // Resume timer using Date.now() calculation
+        timerRef.current = setInterval(() => {
+          const elapsed = Math.floor((Date.now() - recordingStartTimeRef.current) / 1000);
+          setRecordingTime(elapsed);
+        }, 100);
+      }
+    }
+  }, []);
+
+  // Stop recording
+  const stopRecording = useCallback(() => {
+    console.log('Stopping recording...');
+    
+    // Stop the MediaRecorder with timeout protection
+    if (mediaRecorderRef.current && (mediaRecorderRef.current.state === 'recording' || mediaRecorderRef.current.state === 'paused')) {
+      console.log('Stopping MediaRecorder...');
+      
+      // Add timeout protection for MediaRecorder.stop()
+      const stopTimeout = setTimeout(() => {
+        console.warn('MediaRecorder.stop() timed out, forcing cleanup');
+        forceCleanup();
+      }, 5000); // 5 second timeout
+      
+      try {
+        mediaRecorderRef.current.stop();
+        
+        // Clear timeout if stop() completes normally
+        const originalOnStop = mediaRecorderRef.current.onstop;
+        mediaRecorderRef.current.onstop = (event) => {
+          clearTimeout(stopTimeout);
+          if (originalOnStop) {
+            originalOnStop(event);
+          }
+        };
+      } catch (error) {
+        console.error('Error stopping MediaRecorder:', error);
+        clearTimeout(stopTimeout);
+        forceCleanup();
+      }
+    } else {
+      // If MediaRecorder is not in a valid state, force cleanup
+      forceCleanup();
+    }
+    
+    // Stop all media tracks immediately
+    if (streamRef.current) {
+      console.log('Stopping all media tracks...');
+      streamRef.current.getTracks().forEach(track => {
+        console.log('Stopping track:', track.kind, track.label);
+        track.stop();
+      });
+      streamRef.current = null;
+    }
+    
+    // Clear timer
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    
+    // Hide live preview immediately
+    setShowLivePreview(false);
+    if (livePreviewRef.current) {
+      livePreviewRef.current.srcObject = null;
+    }
+    
+    // Reset state immediately
+    setIsRecording(false);
+    setShowStatusBar(false);
+    setRecordingTime(0);
+    setRecordingType(null);
+    setSelectedSource(null);
+    setIsPaused(false);
+    
+    // Hide controller window
+    if (isElectron() && window.electronAPI) {
+      try {
+        window.electronAPI.closeController();
+      } catch (error) {
+        console.error('Failed to close controller window:', error);
+      }
+    }
+    
+    console.log('Recording stopped and cleaned up');
+  }, []);
+
+  // Force cleanup function for timeout scenarios
+  const forceCleanup = useCallback(() => {
+    console.log('Force cleanup triggered');
+    
+    // Stop all media tracks
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    
+    // Clear timer
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    
+    // Reset state
+    setIsRecording(false);
+    setShowStatusBar(false);
+    setRecordingTime(0);
+    setRecordingType(null);
+    setSelectedSource(null);
+    setIsPaused(false);
+    setShowLivePreview(false);
+    
+    // Hide controller window
+    if (isElectron() && window.electronAPI) {
+      try {
+        window.electronAPI.closeController();
+      } catch (error) {
+        console.error('Failed to close controller window:', error);
+      }
+    }
+    
+    // Clear chunks to prevent memory leaks
+    chunksRef.current = [];
+    
+    console.log('Force cleanup completed');
+  }, []);
+
+  // Emergency stop function for when app gets stuck
+  const emergencyStop = useCallback(() => {
+    console.log('EMERGENCY STOP triggered');
+    
+    // Force stop everything immediately
+    if (mediaRecorderRef.current) {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (error) {
+        console.error('Error in emergency MediaRecorder stop:', error);
+      }
+      mediaRecorderRef.current = null;
+    }
+    
+    // Stop all streams
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    
+    // Clear all timers
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    
+    // Reset all state
+    setIsRecording(false);
+    setShowStatusBar(false);
+    setRecordingTime(0);
+    setRecordingType(null);
+    setSelectedSource(null);
+    setIsPaused(false);
+    setShowLivePreview(false);
+    setShowDropdown(false);
+    setCountdown(0);
+    
+    // Clear chunks
+    chunksRef.current = [];
+    
+    // Hide controller window
+    if (isElectron() && window.electronAPI) {
+      try {
+        window.electronAPI.closeController();
+      } catch (error) {
+        console.error('Failed to close controller window:', error);
+      }
+    }
+    
+    console.log('Emergency stop completed');
+  }, []);
+
+  // Expose emergency stop globally for debugging
+  useEffect(() => {
+    window.emergencyStopRecording = emergencyStop;
+    return () => {
+      delete window.emergencyStopRecording;
+    };
+  }, [emergencyStop]);
+
+  // Cleanup function for component unmount
+  useEffect(() => {
+    return () => {
+      // Clean up any active streams when component unmounts
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      if (mediaRecorderRef.current) {
+        mediaRecorderRef.current = null;
+      }
+    };
+  }, []);
+
+  // Listen for controller commands
+  useEffect(() => {
+    if (isElectron() && window.electronAPI) {
+      const handleControllerCommand = (command) => {
+        console.log('Received controller command:', command);
+        switch (command) {
+          case 'pause':
+            pauseRecording();
+            break;
+          case 'stop':
+            stopRecording();
+            break;
+          default:
+            console.log('Unknown controller command:', command);
+        }
+      };
+
+      window.electronAPI.onControllerCommand(handleControllerCommand);
+
+      return () => {
+        window.electronAPI.removeControllerCommandListener();
+      };
+    }
+  }, [pauseRecording, stopRecording]);
+
+  // Handle recording type selection
+  const handleRecordingTypeSelect = async (type) => {
+    console.log('Selected recording type:', type);
+    setRecordingType(type);
+    setShowDropdown(false);
+    
+    let source = null;
+    
+    // For screen/window recording, show source selector
+    if (type === 'screen' || type === 'screen-mic') {
+      if (screenSources.length === 0) {
+        alert('No screen sources available. Please ensure screen recording permissions are granted.');
+        return;
+      }
+      
+      // Auto-select the main screen source for full screen recording
+      const mainScreen = screenSources.find(s => 
+        s.type === 'screen' && (
+          s.name.toLowerCase().includes('main') || 
+          s.name.toLowerCase().includes('display') ||
+          s.name.toLowerCase().includes('screen')
+        )
+      );
+      
+      source = mainScreen || screenSources.find(s => s.type === 'screen') || screenSources[0];
+      setSelectedSource(source);
+      console.log('Selected source for recording:', source);
+      
+      // Start countdown immediately
+      startCountdown(type, source);
+    } else if (type === 'window') {
+      // For window recording, show tab selector
+      if (screenSources.length === 0) {
+        alert('No screen sources available. Please ensure screen recording permissions are granted.');
+        return;
+      }
+      
+      // Filter to only show window sources (not screens)
+      const windowSources = screenSources.filter(s => s.type === 'window');
+      if (windowSources.length === 0) {
+        alert('No windows available for recording. Please open some applications.');
+        return;
+      }
+      
+      setShowTabSelector(true);
+      return; // Don't start countdown yet, wait for user to select tab
+    } else {
+      // For webcam/audio, start countdown immediately
+      startCountdown(type, null);
+    }
+  };
+
+  // Handle tab selection for window recording
+  const handleTabSelect = (source) => {
+    console.log('Selected tab for recording:', source);
+    setSelectedSource(source);
+    setShowTabSelector(false);
+    
+    // Start countdown with the selected tab
+    startCountdown('window', source);
+  };
+
+  // Handle record button click
+  const handleRecordClick = () => {
+    if (isRecording) {
+      stopRecording();
+    } else {
+      setShowDropdown(!showDropdown);
+    }
+  };
+
+  return (
+    <>
+      {/* Record Button */}
+      <div className="record-btn-container">
+        <button 
+          className={`record-btn ${isRecording ? 'recording' : ''}`}
+          onClick={handleRecordClick}
+          title={isRecording ? 'Stop Recording' : 'Start Recording'}
+        >
+          <span className="record-icon">
+            {isRecording ? (
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
+                <rect x="2" y="2" width="16" height="16"/>
+              </svg>
+            ) : (
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5">
+                <rect x="4" y="7" width="12" height="8" rx="2"/>
+                <circle cx="10" cy="11" r="2.5"/>
+                <path d="M6 4h8M8 4v2M12 4v2"/>
+              </svg>
+            )}
+          </span>
+        </button>
+        
+        {/* Recording Type Dropdown */}
+        {showDropdown && !isRecording && (
+          <div className="recording-dropdown">
+            {recordingTypes.map(type => (
+              <button
+                key={type.id}
+                className="dropdown-item"
+                onClick={() => handleRecordingTypeSelect(type.id)}
+              >
+                <span className="dropdown-icon">{type.icon}</span>
+                <div className="dropdown-content">
+                  <div className="dropdown-title">{type.name}</div>
+                  <div className="dropdown-description">{type.description}</div>
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Countdown Overlay */}
+      {showCountdown && (
+        <div className="countdown-overlay">
+          <div className="countdown-content">
+            <div className="countdown-number">{countdown}</div>
+            <div className="countdown-text">Recording starts in...</div>
+          </div>
+        </div>
+      )}
+
+      {/* Recording Status Bar */}
+      {showStatusBar && isRecording && (
+        <div className="recording-status-bar">
+          <div className="status-left">
+            <div className="recording-indicator">
+              <div className="recording-dot"></div>
+              <span>Recording</span>
+            </div>
+            <div className="recording-type">
+              {recordingTypes.find(t => t.id === recordingType)?.name}
+            </div>
+          </div>
+          
+          <div className="status-center">
+            <div className="recording-time">
+              {formatTime(recordingTime)}
+            </div>
+          </div>
+          
+          <div className="status-right">
+            <button 
+              className="pause-btn"
+              onClick={pauseRecording}
+              title={isPaused ? 'Resume Recording' : 'Pause Recording'}
+            >
+              {isPaused ? (
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                  <path d="M3 2L13 8L3 14V2Z"/>
+                </svg>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                  <rect x="2" y="2" width="4" height="12"/>
+                  <rect x="10" y="2" width="4" height="12"/>
+                </svg>
+              )}
+            </button>
+            <button 
+              className="stop-btn"
+              onClick={stopRecording}
+              title="Stop Recording"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                <rect x="2" y="2" width="12" height="12"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Tab Selector for Window Recording */}
+      {showTabSelector && (
+        <div className="countdown-overlay">
+          <div className="live-preview-container">
+            <h3 style={{ color: 'white', marginBottom: '20px', textAlign: 'center' }}>
+              Select Window to Record
+            </h3>
+            <div style={{ 
+              display: 'grid', 
+              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', 
+              gap: '16px',
+              maxHeight: '400px',
+              overflowY: 'auto',
+              padding: '0 20px'
+            }}>
+              {screenSources
+                .filter(s => s.type === 'window')
+                .map(source => (
+                  <button
+                    key={source.id}
+                    onClick={() => handleTabSelect(source)}
+                    style={{
+                      background: 'rgba(255, 255, 255, 0.1)',
+                      border: '1px solid rgba(255, 255, 255, 0.2)',
+                      borderRadius: '8px',
+                      padding: '12px',
+                      color: 'white',
+                      cursor: 'pointer',
+                      transition: 'all 0.2s ease',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      gap: '8px'
+                    }}
+                    onMouseOver={(e) => {
+                      e.target.style.background = 'rgba(255, 255, 255, 0.2)';
+                      e.target.style.borderColor = 'rgba(255, 255, 255, 0.4)';
+                    }}
+                    onMouseOut={(e) => {
+                      e.target.style.background = 'rgba(255, 255, 255, 0.1)';
+                      e.target.style.borderColor = 'rgba(255, 255, 255, 0.2)';
+                    }}
+                  >
+                    <img 
+                      src={source.thumbnail} 
+                      alt={source.name}
+                      style={{ 
+                        width: '120px', 
+                        height: '80px', 
+                        objectFit: 'cover',
+                        borderRadius: '4px'
+                      }}
+                    />
+                    <span style={{ fontSize: '12px', textAlign: 'center' }}>
+                      {source.name}
+                    </span>
+                  </button>
+                ))}
+            </div>
+            <button
+              onClick={() => setShowTabSelector(false)}
+              style={{
+                background: 'rgba(255, 68, 68, 0.2)',
+                border: '1px solid rgba(255, 68, 68, 0.4)',
+                color: 'white',
+                padding: '8px 16px',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                marginTop: '20px'
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Live Camera Preview */}
+      {showLivePreview && (
+        <div className="live-preview-overlay">
+          <div className="live-preview-container">
+            <video 
+              ref={livePreviewRef}
+              className="live-preview-video"
+              autoPlay
+              muted
+              playsInline
+            />
+            <div className="live-preview-label">Live Camera Preview</div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+};
+
+// Resizable Panel Component
+const ResizablePanel = ({ children, className, initialWidth, minWidth = 200, onResize }) => {
+  const [width, setWidth] = useState(initialWidth);
+  const [isResizing, setIsResizing] = useState(false);
+  const panelRef = useRef(null);
+
+  const handleMouseDown = useCallback((e) => {
+    setIsResizing(true);
+    e.preventDefault();
+  }, []);
+
+  const handleMouseMove = useCallback((e) => {
+    if (!isResizing) return;
+    
+    const newWidth = e.clientX - panelRef.current.offsetLeft;
+    if (newWidth >= minWidth) {
+      setWidth(newWidth);
+      onResize?.(newWidth);
+    }
+  }, [isResizing, minWidth, onResize]);
+
+  const handleMouseUp = useCallback(() => {
+    setIsResizing(false);
+  }, []);
+
+  useEffect(() => {
+    if (isResizing) {
+      document.addEventListener('mousemove', handleMouseMove);
+      document.addEventListener('mouseup', handleMouseUp);
+      return () => {
+        document.removeEventListener('mousemove', handleMouseMove);
+        document.removeEventListener('mouseup', handleMouseUp);
+      };
+    }
+  }, [isResizing, handleMouseMove, handleMouseUp]);
+
+  return (
+    <div 
+      ref={panelRef}
+      className={`resizable-panel ${className}`}
+      style={{ width: `${width}px` }}
+    >
+      {children}
+      <div 
+        className="resize-handle"
+        onMouseDown={handleMouseDown}
+      />
+    </div>
+  );
+};
+
+// Minimizable Panel Component
+const MinimizablePanel = ({ children, className, side, isMinimized, onToggleMinimize, title }) => {
+  return (
+    <div className={`minimizable-panel ${className} ${isMinimized ? 'minimized' : ''}`}>
+      <div className="panel-header">
+        <h3>{title}</h3>
+        <button 
+          className="minimize-btn"
+          onClick={onToggleMinimize}
+          title={isMinimized ? 'Show' : 'Hide'}
+        >
+          {side === 'left' ? (isMinimized ? '▶️' : '◀️') : (isMinimized ? '◀️' : '▶️')}
+        </button>
+      </div>
+      {!isMinimized && (
+        <div className="panel-content">
+          {children}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Clip Details Panel Component
+const ClipDetailsPanel = ({ clip, onClose, onDurationChange }) => {
+  // Handle both regular clips and recording clips
+  const getClipDuration = (clip) => {
+    if (!clip) return 5;
+    // For recording clips, duration is directly on the clip
+    if (clip.duration) return clip.duration;
+    // For regular clips, duration is in clip.media
+    if (clip.media && clip.media.duration) return clip.media.duration;
+    return 5; // Default fallback
+  };
+
+  const [duration, setDuration] = useState(getClipDuration(clip));
+
+  const handleDurationChange = (newDuration) => {
+    setDuration(newDuration);
+    if (onDurationChange) {
+      onDurationChange(clip.id, newDuration);
+    }
+  };
+
+  if (!clip) return null;
+
+  return (
+    <div className="clip-details-panel">
+      <div className="clip-details-header">
+        <h3>Clip Details</h3>
+        <button className="close-btn" onClick={onClose}>×</button>
+      </div>
+      
+      <div className="clip-details-content">
+        <div className="clip-preview">
+          {(clip.media?.type && clip.media.type.startsWith('video/')) || 
+           (clip.type && clip.type.startsWith('video/')) ? (
+            <div className="clip-icon-large">🎬</div>
+          ) : (
+            <div className="clip-icon-large">🖼️</div>
+          )}
+        </div>
+        
+        <div className="clip-info">
+          <h4>{clip.media?.name || clip.name || 'Unknown'}</h4>
+          <p>Type: {clip.media?.type || clip.type || 'Unknown'}</p>
+          <p>Start Time: {((clip.startTime ?? 0)).toFixed(1)}s</p>
+        </div>
+        
+        <div className="duration-controls">
+          <label htmlFor="duration">Duration (seconds):</label>
+          <input
+            id="duration"
+            type="number"
+            min="0.1"
+            max="60"
+            step="0.1"
+            value={duration}
+            onChange={(e) => handleDurationChange(parseFloat(e.target.value))}
+          />
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Inspector Panel Component
+const InspectorPanel = ({ videoFile, projectSettings, onSettingsChange, onRecordingComplete }) => {
+  const [trimInPoint, setTrimInPoint] = useState('00:00:00');
+  const [trimOutPoint, setTrimOutPoint] = useState('00:00:00');
+  const [volume, setVolume] = useState(100);
+  const [isMuted, setIsMuted] = useState(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+
+  const formatTime = (time) => {
+    const hours = Math.floor(time / 3600);
+    const minutes = Math.floor((time % 3600) / 60);
+    const seconds = Math.floor(time % 60);
+    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+  };
+
+  const formatFileSize = (bytes) => {
+    if (!bytes) return '';
+    const mb = bytes / (1024 * 1024);
+    return `${mb.toFixed(1)} MB`;
+  };
+
+  const speedPresets = [0.5, 1, 1.5, 2];
+
+  return (
+    <div className="inspector-panel">
+      {/* Clip Properties Section */}
+      <div className="clip-properties-section">
+        <div className="section-header">
+          <h3>Clip Properties</h3>
+        </div>
+        
+        {videoFile && (
+          <>
+            <div className="thumbnail-preview">
+              <div className="thumbnail-placeholder">
+                {videoFile.type && videoFile.type.startsWith('video/') ? '🎬' : '🖼️'}
+              </div>
+            </div>
+            
+            <div className="metadata-display">
+              <div className="metadata-item">
+                <span className="metadata-label">Filename:</span>
+                <span className="metadata-value">{videoFile.name}</span>
+              </div>
+              <div className="metadata-item">
+                <span className="metadata-label">Duration:</span>
+                <span className="metadata-value">{formatTime(videoFile.duration || 0)}</span>
+              </div>
+              <div className="metadata-item">
+                <span className="metadata-label">Resolution:</span>
+                <span className="metadata-value">{projectSettings.resolution}</span>
+              </div>
+              <div className="metadata-item">
+                <span className="metadata-label">File Size:</span>
+                <span className="metadata-value">{formatFileSize(videoFile.size)}</span>
+              </div>
+              <div className="metadata-item">
+                <span className="metadata-label">Format:</span>
+                <span className="metadata-value">{videoFile.type.split('/')[1].toUpperCase()}</span>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Trim Controls Section */}
+      <div className="trim-controls-section">
+        <div className="section-header">
+          <h3>Trim Controls</h3>
+        </div>
+        
+        <div className="trim-inputs">
+          <div className="trim-input-group">
+            <label>In Point:</label>
+            <input
+              type="text"
+              value={trimInPoint}
+              onChange={(e) => setTrimInPoint(e.target.value)}
+              placeholder="00:00:00"
+            />
+          </div>
+          
+          <div className="trim-input-group">
+            <label>Out Point:</label>
+            <input
+              type="text"
+              value={trimOutPoint}
+              onChange={(e) => setTrimOutPoint(e.target.value)}
+              placeholder="00:00:00"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Audio Controls Section */}
+      <div className="audio-controls-section">
+        <div className="section-header">
+          <h3>Audio Controls</h3>
+        </div>
+        
+        <div className="volume-control">
+          <label>Volume: {volume}%</label>
+            <input
+              type="range"
+              min="0"
+              max="100"
+              value={volume}
+            onChange={(e) => setVolume(parseInt(e.target.value))}
+            />
+          </div>
+          
+        <div className="mute-control">
+          <label>
+            <input
+              type="checkbox"
+              checked={isMuted}
+              onChange={(e) => setIsMuted(e.target.checked)}
+            />
+            Mute
+          </label>
+        </div>
+      </div>
+
+      {/* Speed Controls Section */}
+      <div className="speed-controls-section">
+        <div className="section-header">
+          <h3>Playback Speed</h3>
+        </div>
+        
+          <div className="speed-presets">
+            {speedPresets.map(speed => (
+              <button
+                key={speed}
+                className={`speed-preset ${playbackSpeed === speed ? 'active' : ''}`}
+                onClick={() => setPlaybackSpeed(speed)}
+              >
+                {speed}x
+              </button>
+            ))}
+          </div>
+          
+          <div className="custom-speed">
+          <label>Custom Speed:</label>
+            <input
+              type="number"
+              min="0.1"
+              max="4"
+            step="0.1"
+            value={playbackSpeed}
+            onChange={(e) => setPlaybackSpeed(parseFloat(e.target.value))}
+            />
+          </div>
+      </div>
+    </div>
+  );
+};
+
+// Asset Library Panel Component
+const AssetLibraryPanel = ({ onVideoImported, importedMedia, onMediaDelete, onMediaReorder, onAddToTimeline, onRecordingComplete, setImportedVideo }) => {
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [draggedIndex, setDraggedIndex] = useState(null);
+  const [thumbnails, setThumbnails] = useState({});
+
+  const fileInputRef = useRef(null);
+
+  const handleDragOver = useCallback((e) => {
+    e.preventDefault();
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e) => {
+    e.preventDefault();
+    setIsDragOver(false);
+  }, []);
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    
+    const files = Array.from(e.dataTransfer.files);
+    files.forEach(file => {
+      if (file.type.startsWith('video/') || file.type.startsWith('image/')) {
+        handleFileImport(file);
+      }
+    });
+  }, []);
+
+  const handleFileImport = useCallback(async (file) => {
+    try {
+      console.log('Importing file:', file.name, file.type);
+      
+      // Check for MOV files specifically
+      if (file.name.toLowerCase().endsWith('.mov') || file.type === 'video/quicktime') {
+        console.log('MOV file detected:', file.name, 'MIME type:', file.type);
+      }
+      
+      let enhancedFile = {
+        name: file.name,
+        size: file.size,
+        type: file.type,
+        lastModified: new Date(file.lastModified).toISOString(),
+        file: file,
+        isElectronFile: false
+      };
+
+      // Generate thumbnail and extract metadata
+      if (file.type.startsWith('video/')) {
+        const video = document.createElement('video');
+        video.preload = 'metadata';
+        video.muted = true;
+        
+        const videoUrl = file instanceof File || file instanceof Blob ? URL.createObjectURL(file) : null;
+        video.src = videoUrl;
+        
+        await new Promise((resolve, reject) => {
+          video.onloadedmetadata = () => {
+            enhancedFile.duration = video.duration;
+            enhancedFile.width = video.videoWidth;
+            enhancedFile.height = video.videoHeight;
+            
+            // Generate thumbnail
+            const canvas = document.createElement('canvas');
+            canvas.width = 320;
+            canvas.height = 180;
+            const ctx = canvas.getContext('2d');
+            
+            // Calculate aspect ratio and center the video
+            const videoAspect = video.videoWidth / video.videoHeight;
+            const canvasAspect = 320 / 180;
+            
+            let drawWidth, drawHeight, offsetX = 0, offsetY = 0;
+            
+            if (videoAspect > canvasAspect) {
+              drawHeight = 180;
+              drawWidth = 180 * videoAspect;
+              offsetX = (320 - drawWidth) / 2;
+            } else {
+              drawWidth = 320;
+              drawHeight = 320 / videoAspect;
+              offsetY = (180 - drawHeight) / 2;
+            }
+            
+            video.currentTime = Math.min(1, video.duration / 4); // Seek to 25% or 1 second
+            
+            video.onseeked = () => {
+              ctx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
+              enhancedFile.thumbnail = canvas.toDataURL('image/jpeg', 0.8);
+              URL.revokeObjectURL(videoUrl);
+              resolve();
+            };
+            
+            video.onerror = () => {
+              URL.revokeObjectURL(videoUrl);
+              reject(new Error('Failed to load video metadata'));
+            };
+          };
+          
+          video.onerror = () => {
+            URL.revokeObjectURL(videoUrl);
+            reject(new Error('Failed to load video'));
+          };
+        });
+      } else if (file.type.startsWith('image/')) {
+        const img = new Image();
+        img.src = file instanceof File || file instanceof Blob ? URL.createObjectURL(file) : '';
+        
+        await new Promise((resolve) => {
+          img.onload = () => {
+            enhancedFile.width = img.width;
+            enhancedFile.height = img.height;
+            
+            const canvas = document.createElement('canvas');
+            canvas.width = 320;
+            canvas.height = 180;
+            const ctx = canvas.getContext('2d');
+            
+            // Calculate aspect ratio and center the image
+            const imgAspect = img.width / img.height;
+            const canvasAspect = 320 / 180;
+            
+            let drawWidth, drawHeight, offsetX = 0, offsetY = 0;
+            
+            if (imgAspect > canvasAspect) {
+              drawHeight = 180;
+              drawWidth = 180 * imgAspect;
+              offsetX = (320 - drawWidth) / 2;
+            } else {
+              drawWidth = 320;
+              drawHeight = 320 / imgAspect;
+              offsetY = (180 - drawHeight) / 2;
+            }
+            
+            ctx.drawImage(img, offsetX, offsetY, drawWidth, drawHeight);
+            enhancedFile.thumbnail = canvas.toDataURL('image/jpeg', 0.8);
+            URL.revokeObjectURL(img.src);
+            resolve();
+          };
+          img.onerror = resolve;
+        });
+      }
+
+      onVideoImported(enhancedFile);
+    } catch (error) {
+      console.error('Error importing file:', error);
+    }
+  }, [onVideoImported]);
+
+  const handleFilePicker = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const handleFileInputChange = useCallback((e) => {
+    const files = Array.from(e.target.files);
+    files.forEach(file => {
+      if (file.type.startsWith('video/') || file.type.startsWith('image/')) {
+        handleFileImport(file);
+      }
+    });
+    e.target.value = ''; // Reset input
+  }, [handleFileImport]);
+
+  const handleMediaClick = useCallback((media) => {
+    setImportedVideo(media);
+  }, [setImportedVideo]);
+
+  const handleAddToTimeline = useCallback((media) => {
+    // Pass the media directly to the parent's handleAddToTimeline
+    // The parent will calculate the sequential placement
+    onAddToTimeline(media);
+  }, [onAddToTimeline]);
+
+  const handleMediaDragStart = useCallback((e, index) => {
+    setDraggedIndex(index);
+    e.dataTransfer.effectAllowed = 'copy';
+    // Store media data for timeline drop
+    e.dataTransfer.setData('application/json', JSON.stringify({
+      type: 'media',
+      media: importedMedia[index],
+      index: index
+    }));
+  }, [importedMedia]);
+
+  const handleMediaDragOver = useCallback((e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+  }, []);
+
+  const handleMediaDrop = useCallback((e) => {
+    e.preventDefault();
+    // Handle reordering logic here if needed
+  }, []);
+
+  return (
+    <div className="asset-library-panel">
+      <div className="panel-header">
+        <h3>Media Library</h3>
+      </div>
+      
+      <div className="media-actions">
+          <button 
+            className="import-btn"
+            onClick={handleFilePicker}
+            title="Import Media Files"
+          >
+          <span className="btn-icon"></span>
+          Upload
+          </button>
+        <div className="record-btn-wrapper">
+          <RecordingManager onRecordingComplete={onRecordingComplete} />
+        </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="video/*,image/*"
+            multiple
+            onChange={handleFileInputChange}
+            style={{ display: 'none' }}
+          />
+      </div>
+
+      <div 
+        className={`media-drop-zone ${isDragOver ? 'drag-over' : ''}`}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+      >
+        {isDragOver && (
+          <div className="drop-overlay">
+            <div className="drop-icon">📁</div>
+            <p>Drop media files here</p>
+          </div>
+        )}
+        
+        <div className="media-list">
+          {importedMedia.map((media, index) => (
+            <div
+              key={media.name}
+              className="media-item"
+              draggable
+              onDragStart={(e) => handleMediaDragStart(e, index)}
+              onDragOver={handleMediaDragOver}
+              onDrop={handleMediaDrop}
+              onClick={() => handleMediaClick(media)}
+            >
+              <div className="media-thumbnail">
+                {media.thumbnail ? (
+                  <img 
+                    src={media.thumbnail} 
+                    alt={media.name}
+                    className="thumbnail-image"
+                  />
+                ) : (
+                  <div className="thumbnail-placeholder">
+                    {media.type.startsWith('video/') ? '🎬' : '🖼️'}
+                  </div>
+                )}
+                
+                <div className="media-overlay">
+                  <div className="media-info">
+                    <span className="media-name">{media.name}</span>
+                    <span className="media-duration">
+                      {media.duration ? `${Math.floor(media.duration)}s` : ''}
+                    </span>
+                  </div>
+                  
+                  <div className="media-actions">
+                    <button
+                      className="add-to-timeline-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleAddToTimeline(media);
+                      }}
+                      title="Add to Timeline"
+                    >
+                      ➕
+                    </button>
+                    <button
+                      className="media-delete-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onMediaDelete(media.name);
+                      }}
+                      title="Delete"
+                    >
+                      🗑️
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))}
+          
+          {importedMedia.length === 0 && (
+            <div className="empty-state">
+              <div className="empty-icon">📁</div>
+              <p>No media files imported</p>
+              <p className="empty-subtitle">Drag and drop files or click Import</p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Resizable Timeline Component
+const ResizableTimeline = ({ clips, onClipSelect, onClipMove, setTimelineClips, findAvailableTrack, onTimeChange, currentTimelineTime, duration, isPlaying, onPlayPause }) => {
+  const [playheadPosition, setPlayheadPosition] = useState(0);
+  const [pixelsPerSecond, setPixelsPerSecond] = useState(50);
+  const [isSnapEnabled, setIsSnapEnabled] = useState(true);
+  const [draggedClip, setDraggedClip] = useState(null);
+  const [dragOffset, setDragOffset] = useState(0);
+  const [isResizing, setIsResizing] = useState(false);
+  const [resizeHandle, setResizeHandle] = useState(null);
+  const [selectedClip, setSelectedClip] = useState(null);
+  const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
+  const [zoomLevel, setZoomLevel] = useState(1);
+  const [snapMode, setSnapMode] = useState('grid');
+  const [isDraggingFromLibrary, setIsDraggingFromLibrary] = useState(false);
+  const [dropTrack, setDropTrack] = useState(null);
+  
+  // Playback system state
+  const [timelinePlaying, setTimelinePlaying] = useState(false);
+  const [timelineCurrentTime, setTimelineCurrentTime] = useState(0);
+  const animationFrameRef = useRef(null);
+  const lastTickRef = useRef(Date.now());
+
+  const timelineRef = useRef(null);
+  const playheadRef = useRef(null);
+  const timelineContainerRef = useRef(null);
+  const mediaUrlCacheRef = useRef(new Map()); // Cache for media object URLs
+
+  // Calculate total timeline duration
+  const getTotalTimelineDuration = useCallback(() => {
+    if (clips.length === 0) return 0;
+    return Math.max(...clips.map(clip => clip.endTime || (clip.startTime + (clip.duration || 0))));
+  }, [clips]);
+
+  // Sync timeline internal time with parent's currentTimelineTime
+  useEffect(() => {
+    setTimelineCurrentTime(currentTimelineTime);
+  }, [currentTimelineTime]);
+
+  // Update playhead position based on current timeline time
+  useEffect(() => {
+    if (!isDraggingPlayhead) {
+      const totalDuration = getTotalTimelineDuration();
+      const boundedTime = Math.max(0, Math.min(currentTimelineTime, totalDuration));
+      setPlayheadPosition(boundedTime * pixelsPerSecond); // Start at 0:00 (no offset)
+    }
+  }, [currentTimelineTime, pixelsPerSecond, isDraggingPlayhead, getTotalTimelineDuration]);
+
+  // Update pixels per second based on zoom level
+  useEffect(() => {
+    setPixelsPerSecond(50 * zoomLevel);
+  }, [zoomLevel]);
+
+  // Handle timeline end
+  const handleTimelineEnd = useCallback(() => {
+    console.log('Timeline playback ended');
+    setTimelinePlaying(false);
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    
+    // Pause video when timeline ends
+    const videoElement = document.querySelector('.preview-video');
+    if (videoElement && !videoElement.paused) {
+      videoElement.pause();
+    }
+  }, []);
+
+  // Update video preview function - CRITICAL for playback
+  const updateVideoPreview = useCallback((timelineTime) => {
+    console.log('Timeline: updateVideoPreview called with time:', timelineTime);
+    console.log('Timeline: clips:', clips);
+    console.log('Timeline: timelinePlaying:', timelinePlaying);
+
+    // Find which clip is at current timeline time
+    const activeClip = clips.find(clip => 
+      timelineTime >= clip.startTime && 
+      timelineTime < clip.startTime + (clip.duration || clip.endTime - clip.startTime)
+    );
+
+    console.log('Timeline: activeClip:', activeClip);
+    
+    if (activeClip && activeClip.media) {
+      // Calculate position within the clip
+      const clipDuration = activeClip.duration || (activeClip.endTime - activeClip.startTime);
+      const clipTime = timelineTime - activeClip.startTime + (activeClip.trimStart || 0);
+
+      console.log('Timeline: clipTime:', clipTime, 'clipDuration:', clipDuration);
+      
+      // Update video source if different clip
+      const videoElement = document.querySelector('.preview-video');
+      if (videoElement) {
+        console.log('Timeline: videoElement found, current src:', videoElement.src);
+
+        // Get or create cached URL for this media
+        const mediaKey = `${activeClip.media.name}-${activeClip.media.size || ''}`;
+        let newSrc = mediaUrlCacheRef.current.get(mediaKey);
+
+        if (!newSrc) {
+          // Create new URL and cache it
+          console.log('Timeline: Creating URL for media:', {
+            hasUrl: !!activeClip.media.url,
+            hasBlob: !!activeClip.media.blob,
+            hasFile: !!activeClip.media.file,
+            hasPath: !!activeClip.media.path,
+            blobType: activeClip.media.blob ? typeof activeClip.media.blob : 'none',
+            fileType: activeClip.media.file ? typeof activeClip.media.file : 'none',
+            blobIsFile: activeClip.media.blob instanceof File,
+            blobIsBlob: activeClip.media.blob instanceof Blob,
+            fileIsFile: activeClip.media.file instanceof File,
+            fileIsBlob: activeClip.media.file instanceof Blob
+          });
+          
+        if (activeClip.media.url) {
+            newSrc = activeClip.media.url;
+          } else if (activeClip.media.blob && (activeClip.media.blob instanceof File || activeClip.media.blob instanceof Blob)) {
+          try {
+              newSrc = URL.createObjectURL(activeClip.media.blob);
+              console.log('Timeline: Created object URL from blob:', newSrc);
+          } catch (error) {
+            console.error('Failed to create object URL from blob:', error);
+          }
+          } else if (activeClip.media.file && (activeClip.media.file instanceof File || activeClip.media.file instanceof Blob)) {
+            // This is the most common case for imported files
+            try {
+              newSrc = URL.createObjectURL(activeClip.media.file);
+              console.log('Timeline: Created object URL from file:', newSrc);
+            } catch (error) {
+              console.error('Failed to create object URL from file:', error);
+            }
+          } else if (activeClip.media.path) {
+            // For Electron file paths
+            newSrc = `file://${activeClip.media.path}`;
+          } else if (activeClip.media.isElectronFile && activeClip.media.name) {
+            // Try to construct a file URL from path
+            newSrc = `file://${activeClip.media.name}`;
+          }
+
+          // Cache the URL
+          if (newSrc) {
+            mediaUrlCacheRef.current.set(mediaKey, newSrc);
+          }
+        }
+
+        // Update video source if needed
+        if (newSrc && videoElement.src !== newSrc) {
+          console.log('Timeline: Updating video src to:', newSrc);
+          videoElement.src = newSrc;
+      }
+      
+      // Seek to correct time
+        if (clipTime >= 0 && clipTime <= clipDuration) {
+          console.log('Timeline: Seeking to time:', clipTime);
+        videoElement.currentTime = clipTime;
+        
+          // CRITICAL: Play video if timeline is playing
+        if (timelinePlaying && videoElement.paused) {
+            console.log('Timeline: PLAYING video');
+            videoElement.play()
+              .then(() => console.log('Timeline: Video play SUCCESS'))
+              .catch(err => console.error('Timeline: Video play FAILED:', err));
+          } else if (!timelinePlaying && !videoElement.paused) {
+            console.log('Timeline: PAUSING video');
+            videoElement.pause();
+        }
+      }
+    } else {
+        console.warn('Timeline: No video element found');
+      }
+    } else {
+      console.log('Timeline: No active clip, pausing video');
+      // No clip at this time, pause video
+      const videoElement = document.querySelector('.preview-video');
+      if (videoElement && !videoElement.paused) {
+        videoElement.pause();
+      }
+    }
+  }, [clips, timelinePlaying]);
+
+  // Playback system functions
+  const playTimeline = useCallback(() => {
+    console.log('Starting timeline playback');
+    setTimelinePlaying(true);
+    lastTickRef.current = Date.now();
+    
+    // Calculate total duration of all clips
+    const totalDuration = getTotalTimelineDuration();
+    console.log('Total timeline duration:', totalDuration);
+    
+    if (totalDuration === 0) {
+      console.log('No clips to play');
+      setTimelinePlaying(false);
+      return;
+    }
+    
+    const tick = () => {
+      const now = Date.now();
+      const deltaSeconds = (now - lastTickRef.current) / 1000;
+      lastTickRef.current = now;
+      
+      setTimelineCurrentTime(prev => {
+        const newTime = prev + deltaSeconds;
+        
+        // Stop playback if we've reached the end of all clips
+        if (newTime >= totalDuration) {
+          console.log('Reached end of timeline, stopping playback');
+          handleTimelineEnd();
+          return totalDuration; // Clamp to total duration
+        }
+        
+        // Note: Removed updateVideoPreview call to prevent circular state updates
+        // Video synchronization is handled by VideoPreviewPanel component
+        
+        // Notify parent of time change
+        if (onTimeChange) {
+          onTimeChange(newTime);
+        }
+        
+        return newTime;
+      });
+      
+      // Continue animation - check will happen via pauseTimeline canceling the frame
+        animationFrameRef.current = requestAnimationFrame(tick);
+    };
+    
+    animationFrameRef.current = requestAnimationFrame(tick);
+  }, [onTimeChange, getTotalTimelineDuration, handleTimelineEnd]);
+
+  const pauseTimeline = useCallback(() => {
+    console.log('Pausing timeline playback');
+    setTimelinePlaying(false);
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+
+    // Also pause the video element
+    const videoElement = document.querySelector('.preview-video');
+    if (videoElement && !videoElement.paused) {
+      videoElement.pause();
+    }
+  }, []);
+
+  // Handle play/pause button
+  const handleTimelinePlayPause = useCallback(() => {
+    if (timelinePlaying) {
+      pauseTimeline();
+    } else {
+      playTimeline();
+    }
+    
+    // Also notify parent component
+    if (onPlayPause) {
+      onPlayPause();
+    }
+  }, [timelinePlaying, pauseTimeline, playTimeline, onPlayPause]);
+
+  // Sync timeline internal playing state with parent's isPlaying prop
+  useEffect(() => {
+    if (isPlaying !== timelinePlaying) {
+      console.log('ResizableTimeline: Syncing playing state. External:', isPlaying, 'Internal:', timelinePlaying);
+      if (isPlaying) {
+        playTimeline();
+      } else {
+        pauseTimeline();
+      }
+    }
+  }, [isPlaying, timelinePlaying, playTimeline, pauseTimeline]);
+
+  // Note: Removed automatic onPlayPause call to prevent circular state updates
+  // The onPlayPause callback should only be called on user interaction, not on state changes
+
+  // Note: Removed automatic updateVideoPreview call to prevent circular state updates
+  // The video synchronization is now handled by the VideoPreviewPanel component
+  // which receives timelineCurrentTime as a prop and handles video updates internally
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+      const videoElement = document.querySelector('.preview-video');
+      if (videoElement) {
+        try {
+        videoElement.pause();
+        } catch (err) {
+          console.warn('Cleanup pause interrupted:', err.message);
+        }
+      }
+    };
+  }, []);
+
+  // Zoom controls
+  const handleZoomIn = useCallback(() => {
+    setZoomLevel(prev => Math.min(4, prev * 1.2));
+  }, []);
+
+  const handleZoomOut = useCallback(() => {
+    setZoomLevel(prev => Math.max(0.5, prev / 1.2));
+  }, []);
+
+  const handleZoomReset = useCallback(() => {
+    setZoomLevel(1);
+  }, []);
+
+  // Snap functions
+  const snapToGrid = useCallback((time) => {
+    if (!isSnapEnabled || snapMode !== 'grid') return time;
+    const gridSize = 1; // 1 second grid
+    return Math.round(time / gridSize) * gridSize;
+  }, [isSnapEnabled, snapMode]);
+
+  const snapToClips = useCallback((time) => {
+    if (!isSnapEnabled || snapMode !== 'clips') return time;
+    
+    const snapThreshold = 0.5; // 0.5 second threshold
+    const allTimes = [];
+    
+    clips.forEach(clip => {
+      allTimes.push(clip.startTime, clip.endTime);
+    });
+    
+    for (const snapTime of allTimes) {
+      if (Math.abs(time - snapTime) < snapThreshold) {
+        return snapTime;
+      }
+    }
+    
+    return time;
+  }, [isSnapEnabled, snapMode, clips]);
+
+  // Clip operations
+  const handleSplitClip = useCallback(() => {
+    if (!selectedClip) return;
+    
+    const splitTime = currentTimelineTime;
+    if (splitTime <= selectedClip.startTime || splitTime >= selectedClip.endTime) return;
+    
+    const newClip = {
+      ...selectedClip,
+      id: `clip-${Date.now()}`,
+      startTime: splitTime,
+      trimStart: splitTime - selectedClip.startTime + selectedClip.trimStart
+    };
+    
+    const updatedClip = {
+      ...selectedClip,
+      endTime: splitTime,
+      duration: splitTime - selectedClip.startTime,
+      trimEnd: splitTime - selectedClip.startTime + selectedClip.trimStart
+    };
+    
+    setTimelineClips(prev => 
+      prev.map(clip => 
+        clip.id === selectedClip.id ? updatedClip : clip
+      ).concat(newClip)
+    );
+  }, [selectedClip, currentTimelineTime, setTimelineClips]);
+
+  const handleDeleteClip = useCallback(() => {
+    if (!selectedClip) return;
+    setTimelineClips(prev => prev.filter(clip => clip.id !== selectedClip.id));
+    setSelectedClip(null);
+  }, [selectedClip, setTimelineClips]);
+
+  // Handle drag and drop from media library to timeline
+  const handleTimelineDragOver = useCallback((e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    setIsDraggingFromLibrary(true);
+  }, []);
+
+  const handleTimelineDragLeave = useCallback((e) => {
+    e.preventDefault();
+    setIsDraggingFromLibrary(false);
+    setDropTrack(null);
+  }, []);
+
+  const handleTimelineDrop = useCallback((e) => {
+    e.preventDefault();
+    setIsDraggingFromLibrary(false);
+    setDropTrack(null);
+
+    try {
+      const data = e.dataTransfer.getData('application/json');
+      if (!data) return;
+
+      const dragData = JSON.parse(data);
+      if (dragData.type !== 'media') return;
+
+      // Calculate drop position on timeline
+      const timelinePanel = e.target.closest('.timeline-panel') || document.querySelector('.timeline-panel');
+      if (!timelinePanel) return;
+
+      const rect = timelinePanel.getBoundingClientRect();
+      const x = e.clientX - rect.left - 80; // Subtract track label width only
+      const dropTime = Math.max(0, x / pixelsPerSecond);
+
+      // Apply snapping to drop position
+      let snappedTime = snapToGrid(dropTime);
+      snappedTime = snapToClips(snappedTime);
+      
+      // If dropping at the beginning (within 1 second of start), snap to 0:00
+      if (snappedTime <= 1.0) {
+        snappedTime = 0;
+      }
+
+      // Determine which track to drop on
+      const tracksElement = e.target.closest('.timeline-tracks');
+      let targetTrack = 0;
+
+      if (tracksElement) {
+        const trackElements = tracksElement.querySelectorAll('.track');
+        const dropY = e.clientY;
+
+        for (let i = 0; i < trackElements.length; i++) {
+          const trackRect = trackElements[i].getBoundingClientRect();
+          if (dropY >= trackRect.top && dropY <= trackRect.bottom) {
+            targetTrack = i;
+            break;
+          }
+        }
+      }
+
+      // Create new clip from dropped media
+      const newClip = {
+        id: `clip-${Date.now()}`,
+        media: dragData.media,
+        startTime: snappedTime,
+        duration: dragData.media.duration || 5,
+        endTime: snappedTime + (dragData.media.duration || 5),
+        track: targetTrack,
+        trimStart: 0,
+        trimEnd: dragData.media.duration || 5
+      };
+
+      setTimelineClips(prev => [...prev, newClip]);
+    } catch (error) {
+      console.error('Error handling timeline drop:', error);
+    }
+  }, [pixelsPerSecond, snapToGrid, snapToClips, setTimelineClips]);
+
+  const handleTrackDragOver = useCallback((e, trackIndex) => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'copy';
+    setDropTrack(trackIndex);
+  }, []);
+
+  // Handle clip dragging to move clips on timeline
+  const handleClipDragStart = useCallback((e, clip) => {
+    // Don't drag if clicking on trim handles
+    if (e.target.classList.contains('trim-handle')) {
+      return;
+    }
+
+    e.stopPropagation();
+    setDraggedClip(clip);
+    setSelectedClip(clip);
+
+    // Calculate offset from clip start to mouse position
+    const clipElement = e.currentTarget;
+    const rect = clipElement.getBoundingClientRect();
+    const offset = e.clientX - rect.left;
+    setDragOffset(offset);
+  }, []);
+
+  const handleClipDrag = useCallback((e) => {
+    if (!draggedClip) return;
+    e.preventDefault();
+  }, [draggedClip]);
+
+  const handleClipDragEnd = useCallback((e) => {
+    if (!draggedClip) return;
+    e.preventDefault();
+
+    const timelinePanel = document.querySelector('.timeline-panel');
+    if (!timelinePanel) {
+      setDraggedClip(null);
+      return;
+    }
+
+    const rect = timelinePanel.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left - 80; // Subtract track label width only
+    let newStartTime = (mouseX - dragOffset) / pixelsPerSecond;
+
+    // Special snap to 0:00 if within 1 second
+    if (newStartTime <= 1.0 && newStartTime >= -0.5) {
+      newStartTime = 0;
+    } else {
+      // Apply normal snapping
+      newStartTime = snapToGrid(newStartTime);
+      newStartTime = snapToClips(newStartTime);
+      newStartTime = Math.max(0, newStartTime);
+    }
+
+    // Determine which track to drop on
+    const tracksElement = document.querySelector('.timeline-tracks');
+    let targetTrack = draggedClip.track;
+
+    if (tracksElement) {
+      const trackElements = tracksElement.querySelectorAll('.track');
+      const dropY = e.clientY;
+
+      for (let i = 0; i < trackElements.length; i++) {
+        const trackRect = trackElements[i].getBoundingClientRect();
+        if (dropY >= trackRect.top && dropY <= trackRect.bottom) {
+          targetTrack = i;
+          break;
+        }
+      }
+    }
+
+    // Update clip position
+    setTimelineClips(prev =>
+      prev.map(c =>
+        c.id === draggedClip.id
+          ? {
+              ...c,
+              startTime: newStartTime,
+              endTime: newStartTime + c.duration,
+              track: targetTrack
+            }
+          : c
+      )
+    );
+
+    setDraggedClip(null);
+    setDragOffset(0);
+  }, [draggedClip, dragOffset, pixelsPerSecond, snapToGrid, snapToClips, setTimelineClips]);
+
+  // Handle trim handle dragging
+  const handleTrimHandleMouseDown = useCallback((e, clip, handleType) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const startX = e.clientX;
+    const startTrimStart = clip.trimStart || 0;
+    const startTrimEnd = clip.trimEnd || clip.duration;
+    const startStartTime = clip.startTime;
+    const originalDuration = clip.media?.duration || clip.duration;
+
+    const handleMouseMove = (moveEvent) => {
+      const deltaX = moveEvent.clientX - startX;
+      const deltaTime = deltaX / pixelsPerSecond;
+
+      if (handleType === 'left') {
+        // Trim from the start
+        const newTrimStart = Math.max(0, Math.min(startTrimStart + deltaTime, startTrimEnd - 0.1));
+        const newStartTime = startStartTime + deltaTime;
+        const newDuration = startTrimEnd - newTrimStart;
+
+        setTimelineClips(prev =>
+          prev.map(c =>
+            c.id === clip.id
+              ? {
+                  ...c,
+                  trimStart: newTrimStart,
+                  startTime: Math.max(0, newStartTime),
+                  duration: Math.max(0.1, newDuration),
+                  endTime: Math.max(0, newStartTime) + Math.max(0.1, newDuration)
+                }
+              : c
+          )
+        );
+      } else if (handleType === 'right') {
+        // Trim from the end
+        const newTrimEnd = Math.max(startTrimStart + 0.1, Math.min(startTrimEnd + deltaTime, originalDuration));
+        const newDuration = newTrimEnd - startTrimStart;
+
+        setTimelineClips(prev =>
+          prev.map(c =>
+            c.id === clip.id
+              ? {
+                  ...c,
+                  trimEnd: newTrimEnd,
+                  duration: Math.max(0.1, newDuration),
+                  endTime: c.startTime + Math.max(0.1, newDuration)
+                }
+              : c
+          )
+        );
+      }
+    };
+
+    const handleMouseUp = () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+  }, [pixelsPerSecond, setTimelineClips]);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      
+      switch (e.key) {
+        case ' ':
+          e.preventDefault();
+          handleTimelinePlayPause();
+          break;
+        case 'Delete':
+        case 'Backspace':
+          if (selectedClip) {
+            handleDeleteClip();
+          }
+          break;
+        case 's':
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            if (selectedClip) {
+              handleSplitClip();
+            }
+          }
+          break;
+        case '=':
+        case '+':
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            handleZoomIn();
+          }
+          break;
+        case '-':
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            handleZoomOut();
+          }
+          break;
+        case '0':
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            handleZoomReset();
+          }
+          break;
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [selectedClip, handleDeleteClip, handleSplitClip, handleTimelinePlayPause]);
+
+  // Handle playhead dragging with precise mouse alignment
+  const handlePlayheadDrag = (e) => {
+    e.preventDefault();
+    setIsDraggingPlayhead(true);
+    
+    const timelinePanel = e.target.closest('.timeline-panel') || document.querySelector('.timeline-panel');
+    if (!timelinePanel) return;
+
+    const rect = timelinePanel.getBoundingClientRect();
+    const totalDuration = getTotalTimelineDuration();
+
+    const handleMouseMove = (moveEvent) => {
+      // Calculate mouse position relative to timeline
+      const mouseX = moveEvent.clientX - rect.left;
+      
+      // Subtract track label width (80px) to get timeline content position
+      const timelineX = mouseX - 80;
+      
+      // Convert to time
+      let newTime = timelineX / pixelsPerSecond;
+      
+      // Apply bounds
+      newTime = Math.max(0, Math.min(newTime, totalDuration));
+      
+      // Apply snapping
+      newTime = snapToGrid(newTime);
+      newTime = snapToClips(newTime);
+      
+      // Final bounds check
+      newTime = Math.max(0, Math.min(newTime, totalDuration));
+      
+      // Update playhead position to match mouse exactly
+      const newPosition = newTime * pixelsPerSecond; // No offset needed
+      setPlayheadPosition(newPosition);
+      
+      if (onTimeChange) {
+        onTimeChange(newTime);
+      }
+    };
+
+    const handleMouseUp = () => {
+      setIsDraggingPlayhead(false);
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+  };
+
+
+  // Generate time markers
+  const generateTimeMarkers = () => {
+    const markers = [];
+    const totalDuration = getTotalTimelineDuration();
+    const interval = 10; // Every 10 seconds
+    
+    for (let time = 0; time <= totalDuration; time += interval) {
+      // Time markers start at 0:00 (no offset)
+      const position = time * pixelsPerSecond;
+      markers.push(
+        <div
+          key={time}
+          className="time-marker"
+          style={{ left: `${position}px` }}
+        >
+          {Math.floor(time / 60)}:{(time % 60).toString().padStart(2, '0')}
+        </div>
+      );
+    }
+    
+    return markers;
+  };
+
+  // Generate tracks
+  const generateTracks = () => {
+    const maxTrack = Math.max(0, ...clips.map(clip => clip.track || 0));
+    const tracks = [];
+    
+    for (let trackIndex = 0; trackIndex <= Math.max(maxTrack, 1); trackIndex++) {
+      const isAudioTrack = trackIndex >= 2;
+      const trackHeight = isAudioTrack ? 60 : 80;
+      const trackLabel = isAudioTrack ? `Audio ${trackIndex - 1}` : `Video ${trackIndex + 1}`;
+      
+      tracks.push(
+        <div key={trackIndex} className={`track ${isAudioTrack ? 'audio-track' : ''} ${dropTrack === trackIndex ? 'drop-target' : ''}`}>
+          <div className="track-label" style={{ height: `${trackHeight}px` }}>
+            <span>{trackLabel}</span>
+            <div className="track-controls">
+            </div>
+          </div>
+          <div
+            className="track-content"
+            style={{ height: `${trackHeight}px` }}
+            onDragOver={(e) => handleTrackDragOver(e, trackIndex)}
+          >
+            {clips
+              .filter(clip => clip.track === trackIndex)
+              .map(clip => (
+                <div
+                  key={clip.id}
+                  className={`timeline-clip ${clip.media?.type?.startsWith('video/') ? 'video' : 'audio'} ${selectedClip?.id === clip.id ? 'selected' : ''}`}
+                  style={{
+                    left: `${clip.startTime * pixelsPerSecond}px`,
+                    width: `${(clip.duration || clip.endTime - clip.startTime) * pixelsPerSecond}px`,
+                    minWidth: '20px',
+                    cursor: draggedClip?.id === clip.id ? 'grabbing' : 'grab'
+                  }}
+                  draggable
+                  onDragStart={(e) => handleClipDragStart(e, clip)}
+                  onDrag={handleClipDrag}
+                  onDragEnd={handleClipDragEnd}
+                  onClick={() => setSelectedClip(clip)}
+                  onDoubleClick={() => onClipSelect?.(clip)}
+                >
+                  <div className="clip-filename-overlay">
+                    {clip.media?.name || clip.name || 'Unknown'}
+                  </div>
+                  <div className="clip-duration-overlay">
+                    {(clip.duration || clip.endTime - clip.startTime).toFixed(1)}s
+                  </div>
+                  <div className="clip-thumbnail-strip"></div>
+                  
+                  {/* Trim handles */}
+                  <div
+                    className="trim-handle left"
+                    onMouseDown={(e) => handleTrimHandleMouseDown(e, clip, 'left')}
+                    title="Trim start"
+                  />
+                  <div
+                    className="trim-handle right"
+                    onMouseDown={(e) => handleTrimHandleMouseDown(e, clip, 'right')}
+                    title="Trim end"
+                  />
+                </div>
+              ))}
+            
+            {/* Empty track message */}
+            {clips.filter(clip => clip.track === trackIndex).length === 0 && (
+              <div className="empty-track">
+                <div className="empty-track-icon">🎬</div>
+                <span>Drag media here or double-click to add</span>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+    
+    return tracks;
+  };
+
+  const formatTime = (time) => {
+    const minutes = Math.floor(time / 60);
+    const seconds = Math.floor(time % 60);
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+  };
+
+  return (
+    <div className="timeline-panel" ref={timelineRef}>
+      {/* Timeline Header */}
+      <div className="timeline-header">
+        <button 
+          className="timeline-play-button"
+          onClick={handleTimelinePlayPause}
+          title={timelinePlaying ? 'Pause' : 'Play'}
+        >
+          {timelinePlaying ? (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="6" y="4" width="4" height="16"/>
+              <rect x="14" y="4" width="4" height="16"/>
+            </svg>
+          ) : (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+              <polygon points="5,3 19,12 5,21"/>
+            </svg>
+          )}
+        </button>
+        
+        <div className="timeline-timecode">
+          {formatTime(timelineCurrentTime)} / {formatTime(getTotalTimelineDuration())}
+        </div>
+        
+        <div className="timeline-zoom-controls">
+          <button 
+            className="timeline-zoom-btn"
+            onClick={handleZoomOut}
+            title="Zoom Out"
+          >
+            −
+          </button>
+          <span className="timeline-zoom-level">
+            {Math.round(zoomLevel * 100)}%
+          </span>
+          <button 
+            className="timeline-zoom-btn"
+            onClick={handleZoomIn}
+            title="Zoom In"
+          >
+            +
+          </button>
+          <button 
+            className="timeline-zoom-btn"
+            onClick={handleZoomReset}
+            title="Reset Zoom"
+          >
+            ⌂
+          </button>
+          <button 
+            className="timeline-zoom-btn"
+            onClick={() => {
+              const totalDuration = getTotalTimelineDuration();
+              setTimelineCurrentTime(totalDuration);
+              onTimeChange?.(totalDuration);
+              handleTimelineEnd();
+            }}
+            title="Go to End"
+          >
+            ⏭️
+          </button>
+        </div>
+      </div>
+
+      {/* Timeline Ruler */}
+      <div className="timeline-ruler">
+        {generateTimeMarkers()}
+      </div>
+
+      {/* Timeline Playhead */}
+      <div
+        ref={playheadRef}
+        className="timeline-playhead"
+        style={{ left: `${playheadPosition}px` }}
+        onMouseDown={handlePlayheadDrag}
+      >
+        <div className="playhead-handle"></div>
+      </div>
+
+      {/* Timeline Tracks */}
+      <div
+        className={`timeline-tracks ${isDraggingFromLibrary ? 'drag-over' : ''}`}
+        onDragOver={handleTimelineDragOver}
+        onDragLeave={handleTimelineDragLeave}
+        onDrop={handleTimelineDrop}
+      >
+        {generateTracks()}
+      </div>
+    </div>
+  );
+};
+
+function App() {
+  const [importedVideo, setImportedVideo] = useState(null);
+  const [importedMedia, setImportedMedia] = useState([]);
+  const [timelineClips, setTimelineClips] = useState([]);
+  const [selectedClip, setSelectedClip] = useState(null);
+  const [showClipDetails, setShowClipDetails] = useState(false);
+  const [projectSettings, setProjectSettings] = useState({
+    resolution: '1920x1080',
+    frameRate: '30',
+    quality: 'high'
+  });
+
+  // CapCut-style panel state
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [activeSidebarItem, setActiveSidebarItem] = useState('media');
+  const [isLeftPanelVisible, setIsLeftPanelVisible] = useState(true);
+  const [isRightPanelVisible, setIsRightPanelVisible] = useState(false);
+  const [isFocusedMode, setIsFocusedMode] = useState(false);
+
+  // Panel sizes (stored in localStorage)
+  const [leftPanelWidth, setLeftPanelWidth] = useState(() => {
+    const saved = localStorage.getItem('clipforge-leftPanelWidth');
+    return saved ? parseInt(saved) : 280;
+  });
+  const [rightPanelWidth, setRightPanelWidth] = useState(() => {
+    const saved = localStorage.getItem('clipforge-rightPanelWidth');
+    return saved ? parseInt(saved) : 320;
+  });
+  const [timelineHeight, setTimelineHeight] = useState(() => {
+    const saved = localStorage.getItem('clipforge-timelineHeight');
+    return saved ? parseInt(saved) : 280;
+  });
+  const [currentTimelineTime, setCurrentTimelineTime] = useState(0);
+  const [projectName, setProjectName] = useState('Untitled Project');
+  const [projectPath, setProjectPath] = useState(null);
+  const [videoDuration, setVideoDuration] = useState(0);
+  const [isVideoPlaying, setIsVideoPlaying] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
+
+  // Project save/load functions
+  const saveProject = useCallback(async () => {
+    const projectData = {
+      name: projectName,
+      version: '1.0.0',
+      createdAt: new Date().toISOString(),
+      modifiedAt: new Date().toISOString(),
+      settings: projectSettings,
+      media: importedMedia,
+      timeline: timelineClips,
+      currentTime: currentTimelineTime
+    };
+
+    if (isElectron()) {
+      try {
+        const result = await electronAPI.saveProject(projectData);
+        if (result.success) {
+          setProjectPath(result.path);
+          console.log('Project saved successfully:', result.path);
+        }
+      } catch (error) {
+        console.error('Failed to save project:', error);
+      }
+      } else {
+      // Browser fallback - download as JSON
+      const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${projectName}.clipforge`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  }, [projectName, projectSettings, importedMedia, timelineClips, currentTimelineTime]);
+
+  const loadProject = useCallback(async () => {
+    if (isElectron()) {
+      try {
+        const result = await electronAPI.loadProject();
+        if (result.success) {
+          const projectData = result.data;
+          setProjectName(projectData.name || 'Untitled Project');
+          setProjectSettings(projectData.settings || projectSettings);
+          setImportedMedia(projectData.media || []);
+          setTimelineClips(projectData.timeline || []);
+          setCurrentTimelineTime(projectData.currentTime || 0);
+          setProjectPath(result.path);
+          console.log('Project loaded successfully:', result.path);
+        }
+      } catch (error) {
+        console.error('Failed to load project:', error);
+      }
+    } else {
+      // Browser fallback - upload JSON file
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.clipforge,application/json';
+      input.onchange = async (e) => {
+        const file = e.target.files[0];
+        if (file) {
+          try {
+            const text = await file.text();
+            const projectData = JSON.parse(text);
+            setProjectName(projectData.name || 'Untitled Project');
+            setProjectSettings(projectData.settings || projectSettings);
+            setImportedMedia(projectData.media || []);
+            setTimelineClips(projectData.timeline || []);
+            setCurrentTimelineTime(projectData.currentTime || 0);
+            console.log('Project loaded successfully');
+          } catch (error) {
+            console.error('Failed to parse project file:', error);
+          }
+        }
+      };
+      input.click();
+    }
+  }, [projectSettings]);
+
+  // Handle video import
+  const handleVideoImported = useCallback(async (file) => {
+    console.log('Video imported:', file);
+    
+    let enhancedFile = { ...file };
+    
+    // Get video metadata (works in both Electron and browser)
+    if (file.type.startsWith('video/')) {
+      try {
+        const video = document.createElement('video');
+        video.preload = 'metadata';
+        video.muted = true;
+        
+        const videoUrl = file.file && (file.file instanceof File || file.file instanceof Blob) ? URL.createObjectURL(file.file) : null;
+        video.src = videoUrl;
+        
+        await new Promise((resolve, reject) => {
+          video.onloadedmetadata = () => {
+            enhancedFile.duration = video.duration;
+            enhancedFile.width = video.videoWidth;
+            enhancedFile.height = video.videoHeight;
+            
+            // Generate thumbnail
+            const canvas = document.createElement('canvas');
+            canvas.width = 320;
+            canvas.height = 180;
+            const ctx = canvas.getContext('2d');
+            
+            // Calculate aspect ratio and center the video
+            const videoAspect = video.videoWidth / video.videoHeight;
+            const canvasAspect = 320 / 180;
+            
+            let drawWidth, drawHeight, offsetX = 0, offsetY = 0;
+            
+            if (videoAspect > canvasAspect) {
+              drawHeight = 180;
+              drawWidth = 180 * videoAspect;
+              offsetX = (320 - drawWidth) / 2;
+            } else {
+              drawWidth = 320;
+              drawHeight = 320 / videoAspect;
+              offsetY = (180 - drawHeight) / 2;
+            }
+            
+            video.currentTime = Math.min(1, video.duration / 4); // Seek to 25% or 1 second
+            
+            video.onseeked = () => {
+              ctx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
+              enhancedFile.thumbnail = canvas.toDataURL('image/jpeg', 0.8);
+              URL.revokeObjectURL(videoUrl);
+              resolve();
+            };
+            
+            video.onerror = () => {
+              URL.revokeObjectURL(videoUrl);
+              reject(new Error('Failed to load video metadata'));
+            };
+          };
+          
+          video.onerror = () => {
+            URL.revokeObjectURL(videoUrl);
+            reject(new Error('Failed to load video'));
+          };
+        });
+      } catch (error) {
+        console.warn('Failed to load video metadata:', error);
+      }
+    }
+    
+    setImportedMedia(prev => [...prev, enhancedFile]);
+    setVideoDuration(enhancedFile.duration || 5);
+  }, []);
+
+  // Handle recording completion
+  const handleRecordingComplete = useCallback(async (recordingFile) => {
+    console.log('Recording completed:', recordingFile);
+    
+    // Generate a thumbnail for the recording if it's a video
+    let enhancedFile = { ...recordingFile };
+    
+    if (recordingFile.type && recordingFile.type.startsWith('video/')) {
+      try {
+        // Create a video element to extract thumbnail
+        const video = document.createElement('video');
+        video.preload = 'metadata';
+        video.muted = true;
+        video.crossOrigin = 'anonymous';
+        
+        // Use the blob URL from the recording
+        const videoUrl = recordingFile.url || (recordingFile.blob && (recordingFile.blob instanceof File || recordingFile.blob instanceof Blob) ? URL.createObjectURL(recordingFile.blob) : null);
+        video.src = videoUrl;
+        
+        await new Promise((resolve, reject) => {
+          video.onloadedmetadata = () => {
+            enhancedFile.duration = video.duration;
+            enhancedFile.width = video.videoWidth;
+            enhancedFile.height = video.videoHeight;
+            
+            // Generate thumbnail
+            const canvas = document.createElement('canvas');
+            canvas.width = 320;
+            canvas.height = 180;
+            const ctx = canvas.getContext('2d');
+            
+            // Calculate aspect ratio and center the video
+            const videoAspect = video.videoWidth / video.videoHeight;
+            const canvasAspect = 320 / 180;
+            
+            let drawWidth, drawHeight, offsetX = 0, offsetY = 0;
+            
+            if (videoAspect > canvasAspect) {
+              drawHeight = 180;
+              drawWidth = 180 * videoAspect;
+              offsetX = (320 - drawWidth) / 2;
+            } else {
+              drawWidth = 320;
+              drawHeight = 320 / videoAspect;
+              offsetY = (180 - drawHeight) / 2;
+            }
+            
+            video.currentTime = Math.min(1, video.duration / 4); // Seek to 25% or 1 second
+            
+            video.onseeked = () => {
+              ctx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
+              enhancedFile.thumbnail = canvas.toDataURL('image/jpeg', 0.8);
+              resolve();
+            };
+            
+            video.onerror = (e) => {
+              console.warn('Failed to generate thumbnail for recording:', e);
+              resolve(); // Continue without thumbnail
+            };
+          };
+          
+          video.onerror = (e) => {
+            console.warn('Failed to load recording metadata:', e);
+            resolve(); // Continue without metadata
+          };
+        });
+      } catch (error) {
+        console.warn('Failed to process recording:', error);
+      }
+    }
+    
+    // Add to imported media
+    setImportedMedia(prev => [...prev, enhancedFile]);
+    
+    // Add to timeline automatically
+      const newClip = {
+      id: `clip-${Date.now()}`,
+      media: enhancedFile,
+        startTime: 0,
+      duration: enhancedFile.duration || 5,
+      endTime: enhancedFile.duration || 5,
+      track: 0,
+      trimStart: 0,
+      trimEnd: enhancedFile.duration || 5
+      };
+      
+      setTimelineClips(prev => [...prev, newClip]);
+  }, []);
+
+  // Handle adding media to timeline with automatic sequential placement
+  const handleAddToTimeline = useCallback((media) => {
+    // Calculate the next available start time (end of last clip)
+    const lastClipEndTime = timelineClips.length > 0 
+      ? Math.max(...timelineClips.map(clip => clip.endTime || (clip.startTime + (clip.duration || 0))))
+      : 0;
+    
+    console.log('handleAddToTimeline: timelineClips.length:', timelineClips.length);
+    console.log('handleAddToTimeline: lastClipEndTime:', lastClipEndTime);
+    console.log('handleAddToTimeline: media:', media);
+    
+    const newClip = {
+      id: `clip-${Date.now()}`,
+      media: media,
+      startTime: lastClipEndTime, // Start after the last clip ends
+      duration: media.duration || 5,
+      endTime: lastClipEndTime + (media.duration || 5),
+      track: 0,
+      trimStart: 0,
+      trimEnd: media.duration || 5
+    };
+    
+    console.log('handleAddToTimeline: newClip:', newClip);
+    
+    setTimelineClips(prev => {
+      const updatedClips = [...prev, newClip];
+      
+      // If this is the first clip being added, automatically start playback
+      if (prev.length === 0) {
+        console.log('handleAddToTimeline: First clip added, starting playback');
+        // Use setTimeout to ensure state update is complete before starting playback
+        setTimeout(() => {
+          setIsVideoPlaying(true);
+        }, 100);
+      }
+      
+      return updatedClips;
+    });
+  }, [timelineClips]);
+
+  // Handle media operations
+  const handleMediaDelete = useCallback((mediaName) => {
+    setImportedMedia(prev => prev.filter(media => media.name !== mediaName));
+    setTimelineClips(prev => prev.filter(clip => clip.media.name !== mediaName));
+  }, []);
+
+  const handleMediaReorder = useCallback((fromIndex, toIndex) => {
+    setImportedMedia(prev => {
+      const newMedia = [...prev];
+      const [removed] = newMedia.splice(fromIndex, 1);
+      newMedia.splice(toIndex, 0, removed);
+      return newMedia;
+    });
+  }, []);
+
+  // Handle clip operations
+  const handleClipSelect = useCallback((clip) => {
+    setSelectedClip(clip);
+    setShowClipDetails(true);
+  }, []);
+
+  const handleClipMove = useCallback((clipId, newStartTime, newTrack) => {
+    setTimelineClips(prev => 
+      prev.map(clip => 
+        clip.id === clipId 
+          ? { ...clip, startTime: newStartTime, track: newTrack }
+          : clip
+      )
+    );
+  }, []);
+
+  const handleClipDurationChange = useCallback((clipId, newDuration) => {
+    setTimelineClips(prev => 
+      prev.map(clip => 
+        clip.id === clipId 
+          ? { ...clip, duration: newDuration, endTime: clip.startTime + newDuration }
+          : clip
+      )
+    );
+  }, []);
+
+  // Find available track for new clips
+  const findAvailableTrack = useCallback((startTime, duration) => {
+    const endTime = startTime + duration;
+    
+    // Find appropriate track for the new clip
+    for (let trackIndex = 0; trackIndex < 10; trackIndex++) {
+      const hasOverlap = timelineClips.some(clip => 
+        clip.track === trackIndex && 
+        !(endTime <= clip.startTime || startTime >= clip.endTime)
+      );
+      
+      if (!hasOverlap) {
+        return trackIndex;
+      }
+    }
+    
+    // If no available track, return the highest track + 1
+    const maxTrack = Math.max(0, ...timelineClips.map(clip => clip.track || 0));
+    return maxTrack + 1;
+  }, [timelineClips]);
+
+  // Handle time change from timeline
+  const handleTimeChange = useCallback((time) => {
+    setCurrentTimelineTime(time);
+  }, []);
+
+  // Handle video state change
+  const handleVideoStateChange = useCallback(({ duration, isPlaying }) => {
+    setVideoDuration(duration);
+    setIsVideoPlaying(isPlaying);
+  }, []);
+
+  // Handle timeline play/pause
+  const handleTimelinePlayPause = useCallback(() => {
+    console.log('App: Timeline play/pause requested. Current state:', isVideoPlaying);
+    setIsVideoPlaying(prev => !prev);
+  }, [isVideoPlaying]);
+
+  // Handle settings change
+  const handleSettingsChange = useCallback((newSettings) => {
+    setProjectSettings(prev => ({ ...prev, ...newSettings }));
+  }, []);
+
+  // Panel toggle functions
+  const toggleSidebar = useCallback(() => {
+    setIsSidebarCollapsed(prev => !prev);
+  }, []);
+
+  const toggleLeftPanel = useCallback(() => {
+    setIsLeftPanelVisible(prev => !prev);
+  }, []);
+
+  const toggleRightPanel = useCallback(() => {
+    setIsRightPanelVisible(prev => !prev);
+  }, []);
+
+  const toggleFocusedMode = useCallback(() => {
+    setIsFocusedMode(prev => !prev);
+  }, []);
+
+  const handleSidebarItemClick = useCallback((item) => {
+    setActiveSidebarItem(item);
+  }, []);
+
+  // Handle panel resizing
+  const handleResize = useCallback((e, side) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = side === 'left' ? leftPanelWidth : rightPanelWidth;
+    
+    const handleMouseMove = (e) => {
+      const deltaX = e.clientX - startX;
+      const newWidth = Math.max(200, Math.min(600, startWidth + deltaX));
+      
+      if (side === 'left') {
+        setLeftPanelWidth(newWidth);
+        localStorage.setItem('clipforge-leftPanelWidth', newWidth.toString());
+      } else {
+        setRightPanelWidth(newWidth);
+        localStorage.setItem('clipforge-rightPanelWidth', newWidth.toString());
+      }
+    };
+    
+    const handleMouseUp = () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+    
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+  }, [leftPanelWidth, rightPanelWidth]);
+
+  // Handle timeline resizing
+  const handleTimelineResize = useCallback((e) => {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = timelineHeight;
+    
+    const handleMouseMove = (e) => {
+      const deltaY = startY - e.clientY; // Inverted because we're resizing from top
+      const newHeight = Math.max(150, Math.min(600, startHeight + deltaY));
+      setTimelineHeight(newHeight);
+      localStorage.setItem('clipforge-timelineHeight', newHeight.toString());
+    };
+    
+    const handleMouseUp = () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+    
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+  }, [timelineHeight]);
+
+  // Export timeline
+  const handleExportTimeline = useCallback(async () => {
+    if (timelineClips.length === 0) {
+      alert('No clips to export');
+      return;
+    }
+
+    setIsExporting(true);
+    setExportProgress(0);
+
+    try {
+      const result = await electronAPI.exportTimeline({
+        clips: timelineClips,
+        resolution: projectSettings.resolution
+      });
+
+      console.log('Export completed:', result);
+      alert(`Video exported successfully to: ${result}`);
+      
+    } catch (error) {
+      console.error('Export failed:', error);
+      alert(`Export failed: ${error.message}`);
+    } finally {
+      setIsExporting(false);
+      setExportProgress(0);
+    }
+  }, [timelineClips, projectSettings.resolution]);
+
+  // Enhanced Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      // Prevent shortcuts when typing in inputs
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+        return;
+      }
+
+      // Global shortcuts (no modifier keys)
+        switch (e.key) {
+        case ' ':
+            e.preventDefault();
+          // Toggle play/pause - this will be handled by video component
+            break;
+        case 'ArrowLeft':
+            e.preventDefault();
+          // Step backward 1 second
+          setCurrentTimelineTime(prev => Math.max(0, prev - 1));
+            break;
+        case 'ArrowRight':
+            e.preventDefault();
+          // Step forward 1 second
+          setCurrentTimelineTime(prev => prev + 1);
+            break;
+        case 'Home':
+            e.preventDefault();
+          // Go to start
+          setCurrentTimelineTime(0);
+          break;
+        case 'End':
+          e.preventDefault();
+          // Go to end
+          setCurrentTimelineTime(videoDuration);
+            break;
+        }
+
+      // Modifier key shortcuts
+      if (e.ctrlKey || e.metaKey) {
+        switch (e.key) {
+          case 's':
+            e.preventDefault();
+            saveProject();
+            break;
+          case 'o':
+            e.preventDefault();
+            loadProject();
+            break;
+          case 'n':
+            e.preventDefault();
+            // New project
+            setProjectName('Untitled Project');
+            setProjectPath(null);
+            setImportedMedia([]);
+            setTimelineClips([]);
+            setCurrentTimelineTime(0);
+            break;
+        }
+      }
+
+      // Shift + modifier shortcuts
+      if (e.shiftKey && (e.ctrlKey || e.metaKey)) {
+        switch (e.key) {
+          case 'ArrowLeft':
+            e.preventDefault();
+            // Step backward 10 seconds
+            setCurrentTimelineTime(prev => Math.max(0, prev - 10));
+            break;
+          case 'ArrowRight':
+            e.preventDefault();
+            // Step forward 10 seconds
+            setCurrentTimelineTime(prev => prev + 10);
+            break;
+        }
+      }
+
+      // Panel shortcuts
+      switch (e.key) {
+        case '1':
+          toggleLeftPanel();
+          break;
+        case '2':
+          toggleRightPanel();
+          break;
+        case 'f':
+          toggleFocusedMode();
+          break;
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [toggleLeftPanel, toggleRightPanel, toggleFocusedMode, saveProject, loadProject, videoDuration]);
+
+  return (
+    <div className="App">
+      <header className="app-header">
+        <div className="header-left">
+          <button className="logo-button" onClick={toggleSidebar} title="Toggle Sidebar">
+            <div className="logo-icon">CF</div>
+            <h1>ClipForge</h1>
+          </button>
+        </div>
+        
+        <div className="header-center">
+          <div className="project-info">
+            <span className="project-name">{projectName}</span>
+            {projectPath && <span className="project-path">{projectPath}</span>}
+          </div>
+        </div>
+
+        <div className="header-right">
+          <button className="device-btn" title="Save Project" onClick={saveProject}>
+            <div className="device-icon">💾</div>
+          </button>
+          <button className="device-btn" title="Load Project" onClick={loadProject}>
+            <div className="device-icon">📁</div>
+          </button>
+          <button className="device-btn" title="Mobile">
+            <div className="device-icon">📱</div>
+          </button>
+          <button className="device-btn" title="Record">
+            <div className="device-icon">📹</div>
+          </button>
+          <button 
+            className="device-btn" 
+            title="Export"
+            onClick={handleExportTimeline}
+            disabled={isExporting || timelineClips.length === 0}
+          >
+            <div className="device-icon">📤</div>
+          </button>
+        </div>
+      </header>
+
+      {/* Export Progress Bar */}
+      {isExporting && (
+        <div className="export-progress">
+          <div className="export-progress-bar">
+            <div 
+              className="export-progress-fill" 
+              style={{ width: `${exportProgress}%` }}
+            />
+          </div>
+          <div className="export-progress-text">
+            Exporting... {exportProgress}%
+          </div>
+        </div>
+      )}
+      
+      {/* Main Workspace */}
+      <main className="workspace">
+        {/* Left Sidebar */}
+        <div className={`capcut-sidebar ${isSidebarCollapsed ? 'collapsed' : ''}`}>
+          <div className="sidebar-nav">
+            <button 
+              className={`sidebar-nav-item ${activeSidebarItem === 'media' ? 'active' : ''}`}
+              onClick={() => handleSidebarItemClick('media')}
+            >
+              <div className="nav-icon">☁️</div>
+              <div className="nav-label">Media</div>
+            </button>
+            <button 
+              className={`sidebar-nav-item ${activeSidebarItem === 'stock' ? 'active' : ''}`}
+              onClick={() => handleSidebarItemClick('stock')}
+            >
+              <div className="nav-icon">🎬</div>
+              <div className="nav-label">Stock</div>
+            </button>
+            <button 
+              className={`sidebar-nav-item ${activeSidebarItem === 'photos' ? 'active' : ''}`}
+              onClick={() => handleSidebarItemClick('photos')}
+            >
+              <div className="nav-icon">🖼️</div>
+              <div className="nav-label">Photos</div>
+            </button>
+            <button 
+              className={`sidebar-nav-item ${activeSidebarItem === 'audio' ? 'active' : ''}`}
+              onClick={() => handleSidebarItemClick('audio')}
+            >
+              <div className="nav-icon">🎵</div>
+              <div className="nav-label">Audio</div>
+            </button>
+            <button 
+              className={`sidebar-nav-item ${activeSidebarItem === 'text' ? 'active' : ''}`}
+              onClick={() => handleSidebarItemClick('text')}
+            >
+              <div className="nav-icon">T</div>
+              <div className="nav-label">Text</div>
+            </button>
+            <button 
+              className={`sidebar-nav-item ${activeSidebarItem === 'captions' ? 'active' : ''}`}
+              onClick={() => handleSidebarItemClick('captions')}
+            >
+              <div className="nav-icon">💬</div>
+              <div className="nav-label">Captions</div>
+            </button>
+            <button 
+              className={`sidebar-nav-item ${activeSidebarItem === 'transcript' ? 'active' : ''}`}
+              onClick={() => handleSidebarItemClick('transcript')}
+            >
+              <div className="nav-icon">📄</div>
+              <div className="nav-label">Transcript</div>
+            </button>
+            <button 
+              className={`sidebar-nav-item ${activeSidebarItem === 'effects' ? 'active' : ''}`}
+              onClick={() => handleSidebarItemClick('effects')}
+            >
+              <div className="nav-icon">✨</div>
+              <div className="nav-label">Effects</div>
+            </button>
+          </div>
+        </div>
+
+        {/* Expandable Left Panel */}
+        {isLeftPanelVisible && !isSidebarCollapsed && (
+          <div
+            className="capcut-left-panel"
+            style={{ width: `${leftPanelWidth}px` }}
+          >
+            <div className="panel-header">
+              <h3>{activeSidebarItem.charAt(0).toUpperCase() + activeSidebarItem.slice(1)}</h3>
+            </div>
+            <div className="panel-content">
+              {activeSidebarItem === 'media' && (
+            <AssetLibraryPanel 
+              onVideoImported={handleVideoImported}
+              importedMedia={importedMedia}
+              onMediaDelete={handleMediaDelete}
+              onMediaReorder={handleMediaReorder}
+              onAddToTimeline={handleAddToTimeline}
+                  onRecordingComplete={handleRecordingComplete}
+                  setImportedVideo={setImportedVideo}
+            />
+              )}
+              {activeSidebarItem === 'stock' && (
+                <div className="coming-soon">
+                  <div className="coming-soon-icon">🎬</div>
+                  <p>Stock Videos</p>
+                  <p className="coming-soon-subtitle">Coming Soon</p>
+                </div>
+              )}
+              {activeSidebarItem === 'photos' && (
+                <div className="coming-soon">
+                  <div className="coming-soon-icon">🖼️</div>
+                  <p>Stock Photos</p>
+                  <p className="coming-soon-subtitle">Coming Soon</p>
+                </div>
+              )}
+              {activeSidebarItem === 'audio' && (
+                <div className="coming-soon">
+                  <div className="coming-soon-icon">🎵</div>
+                  <p>Audio Library</p>
+                  <p className="coming-soon-subtitle">Coming Soon</p>
+                </div>
+              )}
+              {activeSidebarItem === 'text' && (
+                <div className="coming-soon">
+                  <div className="coming-soon-icon">T</div>
+                  <p>Text Tools</p>
+                  <p className="coming-soon-subtitle">Coming Soon</p>
+                </div>
+              )}
+              {activeSidebarItem === 'captions' && (
+                <div className="coming-soon">
+                  <div className="coming-soon-icon">💬</div>
+                  <p>Captions</p>
+                  <p className="coming-soon-subtitle">Coming Soon</p>
+                </div>
+              )}
+              {activeSidebarItem === 'transcript' && (
+                <div className="coming-soon">
+                  <div className="coming-soon-icon">📄</div>
+                  <p>Transcript</p>
+                  <p className="coming-soon-subtitle">Coming Soon</p>
+                </div>
+              )}
+              {activeSidebarItem === 'effects' && (
+                <div className="coming-soon">
+                  <div className="coming-soon-icon">✨</div>
+                  <p>Effects</p>
+                  <p className="coming-soon-subtitle">Coming Soon</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+        
+        {/* Main Content Area */}
+        <div className="workspace-main">
+          <VideoPreviewPanel 
+            videoFile={importedVideo}
+            timelineClips={timelineClips}
+            currentTimelineTime={currentTimelineTime}
+            onTimeChange={handleTimeChange}
+            onVideoStateChange={handleVideoStateChange}
+          />
+        </div>
+        
+        {/* Right Panel - Inspector */}
+        {isRightPanelVisible && (
+          <div
+            className="capcut-right-panel"
+            style={{ width: `${rightPanelWidth}px` }}
+          >
+            <div className="resize-handle left" onMouseDown={(e) => handleResize(e, 'right')}></div>
+            <div className="panel-header">
+              <h3>Inspector</h3>
+              <button
+                className="minimize-btn"
+                onClick={toggleRightPanel}
+                title="Hide Inspector"
+              >
+                ◀️
+              </button>
+            </div>
+            <div className="panel-content">
+              <InspectorPanel 
+                videoFile={importedVideo}
+                projectSettings={projectSettings}
+                onSettingsChange={handleSettingsChange}
+                onRecordingComplete={handleRecordingComplete}
+              />
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* Bottom Timeline */}
+      <div 
+        className="capcut-timeline-container"
+        style={{ height: `${timelineHeight}px` }}
+      >
+        <div
+          className="timeline-resize-handle"
+          onMouseDown={(e) => handleTimelineResize(e)}
+        ></div>
+        <ResizableTimeline 
+          clips={timelineClips}
+          onClipSelect={handleClipSelect}
+          onClipMove={handleClipMove}
+          setTimelineClips={setTimelineClips}
+          findAvailableTrack={findAvailableTrack}
+          onTimeChange={handleTimeChange}
+          currentTimelineTime={currentTimelineTime}
+          duration={videoDuration}
+          isPlaying={isVideoPlaying}
+          onPlayPause={handleTimelinePlayPause}
+        />
+      </div>
+      
+      {/* Clip Details Panel */}
+      {showClipDetails && selectedClip && (
+        <ClipDetailsPanel
+          clip={selectedClip}
+          onClose={() => setShowClipDetails(false)}
+          onDurationChange={handleClipDurationChange}
+        />
+      )}
+    </div>
+  );
+}
+
+export default App;
